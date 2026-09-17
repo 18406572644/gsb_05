@@ -15,6 +15,7 @@
   input, button { font: inherit; padding: 7px 10px; border-radius: 6px; border: 1px solid #2a3550;
                   background: #1c2539; color: inherit; }
   button { cursor: pointer; background: #2f6fed; border-color: #2f6fed; color: #fff; }
+  button.mini { padding: 1px 7px; font-size: 11px; background: #2a3550; border-color: #3a4straight; }
   button:disabled { opacity: .5; cursor: default; }
   main { flex: 1; display: flex; min-height: 0; }
   #sidebar { width: 220px; background: #161d2e; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
@@ -22,11 +23,18 @@
   #sidebar .room.active, #sidebar .room:hover { background: #24304d; }
   #sidebar .badge { color: #7f8db3; font-size: 12px; }
   #chat { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #loadMore { align-self: center; margin: 8px 0 0; padding: 3px 12px; font-size: 12px; background: #24304d; border-color: #2a3550; }
   #messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 6px; }
   .msg { max-width: 70%; padding: 8px 12px; border-radius: 10px; background: #1c2539; align-self: flex-start; }
   .msg.mine { background: #2f6fed; align-self: flex-end; }
-  .msg .meta { font-size: 11px; opacity: .65; margin-bottom: 2px; }
+  .msg .meta { font-size: 11px; opacity: .65; margin-bottom: 2px; display: flex; gap: 6px; align-items: center; }
   .msg .tick { font-size: 11px; opacity: .7; }
+  .msg .edited { font-size: 11px; opacity: .6; font-style: italic; }
+  .msg.revoked .body { font-style: italic; opacity: .55; }
+  .msg .revReason { font-size: 11px; opacity: .7; margin-top: 2px; }
+  .msg .actions { display: none; gap: 4px; margin-left: 4px; }
+  .msg:hover .actions { display: inline-flex; }
+  .msg .actions button { padding: 0 6px; font-size: 10px; background: rgba(255,255,255,.15); border: none; color: inherit; }
   .sys { align-self: center; font-size: 12px; color: #7f8db3; }
   #composer { display: flex; gap: 8px; padding: 12px 16px; background: #161d2e; }
   #composer input { flex: 1; }
@@ -37,6 +45,16 @@
   #members .tag { font-size: 11px; color: #f0b429; }
   #members .tag.muted { color: #e05252; }
   #members button { padding: 2px 6px; font-size: 11px; margin-left: auto; }
+  /* 审计弹窗 */
+  #auditMask { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; z-index: 10; }
+  #auditBox { background: #161d2e; border: 1px solid #2a3550; border-radius: 10px; width: min(560px, 92vw); max-height: 80vh;
+              display: flex; flex-direction: column; }
+  #auditBox h3 { padding: 12px 16px; border-bottom: 1px solid #2a3550; }
+  #auditList { overflow-y: auto; padding: 10px 16px; display: flex; flex-direction: column; gap: 8px; }
+  #auditList .ev { border: 1px solid #2a3550; border-radius: 8px; padding: 8px 10px; font-size: 12px; }
+  #auditList .ev .h { color: #9fb0d8; margin-bottom: 4px; }
+  #auditList .diff { white-space: pre-wrap; word-break: break-all; background: #11182a; border-radius: 6px; padding: 6px 8px; margin-top: 4px; }
+  #auditBox .foot { padding: 10px 16px; border-top: 1px solid #2a3550; text-align: right; }
   .hidden { display: none !important; }
 </style>
 </head>
@@ -74,26 +92,41 @@
   <div id="members" class="hidden"></div>
 </main>
 
+<div id="auditMask" class="hidden">
+  <div id="auditBox">
+    <h3 id="auditTitle">消息审计记录</h3>
+    <div id="auditList"></div>
+    <div class="foot"><button id="auditClose">关闭</button></div>
+  </div>
+</div>
+
 <script>
 'use strict';
 /* 可靠投递客户端协议实现：
  * - 发送：每条消息带唯一 clientMsgId，未收到 ACK 定时重发（服务端幂等去重）；
  * - 接收：按房间记录 lastSeenSeq，seq 小于等于它的一律丢弃（幂等消费）；
- * - ACK：累积确认，500ms 批量上报；
- * - 断线补发：重连后重新 join 并携带 lastSeenSeq，服务端回放缺口；
- * - lastSeenSeq 存 localStorage，刷新页面也不丢进度。
+ * - 编辑/撤回：房间级事件流带单调 rev，按 lastSeenRev 幂等消费；编辑带 version，
+ *   只接受更新版本、撤回为终态，乱序/迟到事件不会把新状态回滚成旧状态；
+ * - 操作幂等：edit/revoke 带 opId，未收到确认时以同一 opId 重发，服务端去重；
+ * - ACK：累积确认，500ms 批量上报 seq 与 rev 两个游标；
+ * - 断线补发：重连后重新 join 并携带 lastSeenSeq/lastSeenRev，服务端双流回放；
+ * - 进度存 localStorage，刷新页面也不丢。
  */
 const $ = (id) => document.getElementById(id);
 let ws = null, me = null, currentRoom = null;
-const rooms = new Map(); // roomId -> {name, role, mutedUntil, lastSeenSeq, msgs:[], pending:Map}
+// roomId -> {name, role, mutedUntil, lastSeenSeq, lastSeenRev, msgs:[], pending:Map, ops:Map}
+const rooms = new Map();
 let reconnectDelay = 500, ackTimer = null, retryTimer = null;
+const MAX_KEEP = 500;
 
 const store = {
   key: () => 'chat:' + me.name,
   load() { try { return JSON.parse(localStorage.getItem(this.key())) || {}; } catch { return {}; } },
   save() {
     const o = {};
-    for (const [id, r] of rooms) o[id] = { name: r.name, lastSeenSeq: r.lastSeenSeq };
+    for (const [id, r] of rooms) {
+      o[id] = { name: r.name, lastSeenSeq: r.lastSeenSeq, lastSeenRev: r.lastSeenRev || 0 };
+    }
     localStorage.setItem(this.key(), JSON.stringify(o));
   },
 };
@@ -115,10 +148,14 @@ function connect() {
   ws = new WebSocket(`ws://${location.host}/ws?token=${encodeURIComponent(me.token)}`);
   ws.onopen = () => {
     setStatus('on', '已连接'); reconnectDelay = 500;
-    // 重连后恢复所有房间：携带本地进度，服务端补发缺口
+    // 重连后恢复所有房间：携带消息/事件双流进度，服务端补发缺口
     const saved = store.load();
     for (const [roomId, info] of Object.entries(saved)) {
-      ws.send(JSON.stringify({ type: 'join', room: roomId, lastSeq: info.lastSeenSeq || 0 }));
+      ws.send(JSON.stringify({
+        type: 'join', room: roomId,
+        lastSeq: info.lastSeenSeq || 0,
+        lastRev: info.lastSeenRev || 0,
+      }));
     }
   };
   ws.onmessage = (ev) => handle(JSON.parse(ev.data));
@@ -132,14 +169,36 @@ function connect() {
 
 function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
 
+/** 数字 seq 按序排列；未确认的乐观占位（seq='…'）沉底 */
+function sortMsgs(r) {
+  const order = (x) => (typeof x.seq === 'number' ? x.seq : Number.MAX_SAFE_INTEGER);
+  r.msgs.sort((a, b) => order(a) - order(b));
+}
+
+/** 按 seq 合并服务端消息快照（服务端为权威状态，覆盖本地旧字段） */
+function mergeMessage(r, m) {
+  const idx = r.msgs.findIndex((x) => x.seq === m.seq || (m.clientMsgId && x.clientMsgId === m.clientMsgId));
+  const mine = m.from === me.userId || (idx >= 0 && r.msgs[idx].mine);
+  if (idx >= 0) {
+    r.msgs[idx] = { ...r.msgs[idx], ...m, mine, pending: false };
+    return r.msgs[idx];
+  }
+  const next = { ...m, mine };
+  r.msgs.push(next);
+  sortMsgs(r);
+  if (r.msgs.length > MAX_KEEP) r.msgs.splice(0, r.msgs.length - MAX_KEEP);
+  return next;
+}
+
 function handle(m) {
   switch (m.type) {
     case 'welcome': break;
     case 'joined': {
       const saved = store.load();
-      const r = rooms.get(m.roomId) || { msgs: [], pending: new Map(), lastSeenSeq: 0 };
+      const r = rooms.get(m.roomId) || { msgs: [], pending: new Map(), ops: new Map(), lastSeenSeq: 0, lastSeenRev: 0 };
       r.name = m.name; r.role = m.role; r.mutedUntil = m.mutedUntil;
       r.lastSeenSeq = Math.max(r.lastSeenSeq, saved[m.roomId]?.lastSeenSeq || 0);
+      r.lastSeenRev = Math.max(r.lastSeenRev || 0, saved[m.roomId]?.lastSeenRev || 0);
       rooms.set(m.roomId, r);
       if (!currentRoom) currentRoom = m.roomId;
       renderRooms(); render(); refreshMembers();
@@ -147,17 +206,10 @@ function handle(m) {
     }
     case 'msg': {
       const r = rooms.get(m.roomId); if (!r) break;
-      if (m.seq <= r.lastSeenSeq) break;          // 幂等消费：重复投递直接丢弃
-      r.lastSeenSeq = m.seq;
-      // 自己发的消息：广播回包更新乐观插入的占位消息，不重复上屏
-      const own = m.clientMsgId ? r.msgs.findIndex((x) => x.clientMsgId === m.clientMsgId) : -1;
-      if (own >= 0) {
-        r.msgs[own] = { ...m, mine: true, pending: false };
-        r.pending.delete(m.clientMsgId);
-      } else {
-        r.msgs.push({ ...m, mine: m.from === me.userId });
-      }
-      if (r.msgs.length > 500) r.msgs.splice(0, r.msgs.length - 500);
+      if (typeof m.seq === 'number' && m.seq <= r.lastSeenSeq) break;  // 幂等消费
+      mergeMessage(r, m);
+      if (m.clientMsgId) r.pending.delete(m.clientMsgId);
+      if (typeof m.seq === 'number') r.lastSeenSeq = Math.max(r.lastSeenSeq, m.seq);
       store.save(); scheduleAck();
       render();
       break;
@@ -167,12 +219,74 @@ function handle(m) {
       const p = r.pending.get(m.clientMsgId);
       if (p) p.acked = true;
       const own = r.msgs.find((x) => x.clientMsgId === m.clientMsgId);
-      if (own) { own.pending = false; own.seq = m.seq; }
+      if (own) { own.pending = false; own.seq = m.seq; sortMsgs(r); }
+      render();
+      break;
+    }
+    case 'msg_edited': {                           // 编辑事件：按 rev 幂等、按 version 防旧覆盖新
+      const r = rooms.get(m.roomId); if (!r) break;
+      if (m.rev <= (r.lastSeenRev || 0)) break;
+      const target = r.msgs.find((x) => x.seq === m.seq);
+      if (target && !target.revokedAt && (target.version || 1) < m.version) {
+        target.content = m.content;
+        target.version = m.version;
+        target.editedAt = m.editedAt;
+      }
+      r.lastSeenRev = m.rev;
+      store.save(); scheduleAck();
+      render();
+      break;
+    }
+    case 'msg_revoked': {                          // 撤回事件：终态，幂等
+      const r = rooms.get(m.roomId); if (!r) break;
+      if (m.rev <= (r.lastSeenRev || 0)) break;
+      const target = r.msgs.find((x) => x.seq === m.seq);
+      if (target && !target.revokedAt) {
+        target.revokedAt = m.ts;
+        target.revokedBy = m.by;
+        target.revokedByName = m.byName;
+        target.revokeReason = m.reason;
+        target.content = null;
+      }
+      r.lastSeenRev = m.rev;
+      store.save(); scheduleAck();
+      render();
+      break;
+    }
+    case 'edit_ack':
+    case 'revoke_ack': {                           // 我的编辑/撤回操作被确认（opId 幂等）
+      const r = rooms.get(m.roomId); if (!r) break;
+      r.ops.delete(m.opId);
+      const target = r.msgs.find((x) => x.seq === m.seq);
+      if (target && m.type === 'edit_ack') {
+        target.version = m.version;
+        target.editedAt = m.editedAt;
+      }
+      if (target && m.type === 'revoke_ack' && !target.revokedAt && m.revokedAt) {
+        target.revokedAt = m.revokedAt; target.content = null;
+      }
       render();
       break;
     }
     case 'sync_done':
-      if (m.hasMore) send({ type: 'sync', roomId: m.roomId, lastSeq: m.lastSeq });
+      { const r = rooms.get(m.roomId);
+        if (r) {
+          r.lastSeenSeq = Math.max(r.lastSeenSeq, m.lastSeq);
+          r.lastSeenRev = Math.max(r.lastSeenRev || 0, m.lastRev || 0);
+          store.save(); scheduleAck();
+        }
+        if (m.hasMore) send({ type: 'sync', roomId: m.roomId, lastSeq: m.lastSeq, lastRev: m.lastRev });
+      }
+      break;
+    case 'history': {                              // 历史翻页：按 seq 合并快照（撤回/编辑态自带）
+      const r = rooms.get(m.roomId); if (!r) break;
+      for (const sm of m.messages) mergeMessage(r, sm);
+      sortMsgs(r);
+      render();
+      break;
+    }
+    case 'msg_audit':
+      showAudit(m);
       break;
     case 'notice': {
       const r = rooms.get(m.roomId);
@@ -184,31 +298,72 @@ function handle(m) {
     case 'members':
       if (m.roomId === currentRoom) renderMembers(m.members);
       break;
-    case 'error':
-      sys(currentRoom, `错误 [${m.code}] ${m.message}`);
+    case 'error': {
+      // 版本冲突 / 撤回终态：服务端在 current 中给出权威快照，直接覆盖本地并丢弃等待中的旧操作
+      if (m.current) {
+        const r = rooms.get(m.current.roomId);
+        if (r) {
+          r.ops.delete(m.ref);
+          mergeMessage(r, m.current);
+          render();
+        }
+        sys(m.current.roomId,
+          m.code === 'MESSAGE_REVOKED' ? '消息已被撤回，无法编辑' : '消息已被其他操作更新，已刷新到最新版本');
+      } else {
+        // 操作被拒：跨房间找到对应 opId 的乐观操作并回滚
+        let hit = null;
+        for (const [rid, rr] of rooms) {
+          if (rr.ops.has(m.ref)) { hit = { rid, r: rr, op: rr.ops.get(m.ref) }; break; }
+        }
+        if (hit) { hit.r.ops.delete(m.ref); rollbackOp(hit.op, hit.r); }
+        sys(currentRoom, `错误 [${m.code}] ${m.message}`);
+      }
       break;
+    }
     case 'server_shutdown': sys(currentRoom, '服务器即将重启…'); break;
   }
+}
+
+/** 操作失败时回滚乐观修改 */
+function rollbackOp(op, r) {
+  const t = r.msgs.find((x) => x.seq === op.seq);
+  if (!t) return;
+  if (op.kind === 'edit') {
+    t.content = op.prev.content; t.version = op.prev.version; t.editedAt = op.prev.editedAt;
+  } else if (op.kind === 'revoke') {
+    Object.assign(t, op.prev);
+  }
+  render();
 }
 
 function scheduleAck() {
   if (ackTimer) return;
   ackTimer = setTimeout(() => {
     ackTimer = null;
-    for (const [id, r] of rooms) if (r.lastSeenSeq > 0) send({ type: 'ack', roomId: id, seq: r.lastSeenSeq });
+    for (const [id, r] of rooms) {
+      if (r.lastSeenSeq > 0 || r.lastSeenRev > 0) {
+        send({ type: 'ack', roomId: id, seq: r.lastSeenSeq, rev: r.lastSeenRev || 0 });
+      }
+    }
   }, 500);
 }
 
 function refreshMembers() { if (currentRoom) send({ type: 'members', roomId: currentRoom }); }
 setInterval(refreshMembers, 5000);
 
-// 未 ACK 的消息每秒重发一次（clientMsgId 不变，服务端幂等）
+// 未确认的消息 / 编辑 / 撤回操作每秒重发一次（ID 不变，服务端幂等）
 retryTimer = setInterval(() => {
   for (const [roomId, r] of rooms) {
     for (const [cid, p] of r.pending) {
       if (!p.acked && Date.now() - p.sentAt > 1000) {
         p.sentAt = Date.now();
         send({ type: 'msg', roomId, clientMsgId: cid, content: p.content });
+      }
+    }
+    for (const op of r.ops.values()) {
+      if (Date.now() - op.sentAt > 1000) {
+        op.sentAt = Date.now();
+        send(op.frame);
       }
     }
   }
@@ -234,20 +389,116 @@ function render() {
   const r = rooms.get(currentRoom);
   $('composer').classList.toggle('hidden', !r);
   $('members').classList.toggle('hidden', !r);
-  if (!r) return;
+  if (!r) { $('messages').innerHTML = ''; return; }
   const box = $('messages');
-  box.innerHTML = r.msgs.map((m) => {
+  const firstSeq = r.msgs.filter((x) => typeof x.seq === 'number').reduce((a, x) => Math.min(a, x.seq), Infinity);
+  const loadMore = Number.isFinite(firstSeq) && firstSeq > 1
+    ? `<button id="loadMore">↑ 加载更早的消息</button>` : '';
+  box.innerHTML = loadMore + r.msgs.map((m) => {
     if (m.sys) return `<div class="sys">${escapeHtml(m.sys)}</div>`;
-    const tick = m.mine ? `<span class="tick">${m.pending ? '…' : '✓'}</span>` : '';
-    return `<div class="msg ${m.mine ? 'mine' : ''}">
-      <div class="meta">${escapeHtml(m.fromName || '')} · #${m.seq} ${tick}</div>
-      <div>${escapeHtml(m.content)}</div></div>`;
+    return renderMsg(m, r);
   }).join('');
+  const more = $('loadMore');
+  if (more) more.onclick = () => send({ type: 'history', roomId: currentRoom, beforeSeq: firstSeq, limit: 30 });
   box.scrollTop = box.scrollHeight;
   const muted = r.mutedUntil > Date.now();
   $('msgInput').placeholder = muted ? `你已被禁言至 ${new Date(r.mutedUntil).toLocaleTimeString()}` : '发送消息…';
   $('msgInput').disabled = muted;
 }
+
+function renderMsg(m, r) {
+  const tick = m.mine ? `<span class="tick">${m.pending ? '…' : '✓'}</span>` : '';
+  const actions = bubbleActions(m, r);
+  if (m.revokedAt) {
+    const byAdmin = m.revokedBy && m.revokedBy !== m.from;
+    const reason = m.revokeReason
+      ? `<div class="revReason">${byAdmin ? '管理员撤回' : '撤回原因'}：${escapeHtml(m.revokeReason)}</div>` : '';
+    return `<div class="msg ${m.mine ? 'mine' : ''} revoked" data-seq="${m.seq}">
+      <div class="meta">${escapeHtml(m.fromName || '')} · #${m.seq} ${tick}${actions}</div>
+      <div class="body">已撤回${byAdmin && m.revokedByName ? `（${escapeHtml(m.revokedByName)} 处理）` : ''} · ${new Date(m.revokedAt).toLocaleTimeString()}</div>
+      ${reason}</div>`;
+  }
+  const edited = m.editedAt
+    ? `<span class="edited" title="查看审计记录" data-act="audit">已编辑</span>` : '';
+  return `<div class="msg ${m.mine ? 'mine' : ''}" data-seq="${m.seq}">
+    <div class="meta">${escapeHtml(m.fromName || '')} · #${m.seq} ${edited} ${tick}${actions}</div>
+    <div class="body">${escapeHtml(m.content)}</div></div>`;
+}
+
+/** 悬停操作：本人可编辑/撤回/查看审计；管理员可撤回他人消息（需填原因）；任何人可看审计 */
+function bubbleActions(m, r) {
+  if (typeof m.seq !== 'number') return '<span class="actions"></span>';
+  const btns = [];
+  if (m.mine && !m.revokedAt) {
+    btns.push(`<button data-act="edit" title="编辑">改</button>`);
+    btns.push(`<button data-act="revoke" title="撤回">撤</button>`);
+  } else if (r.role === 'admin' && !m.revokedAt) {
+    btns.push(`<button data-act="admin-revoke" title="按违规处理撤回">违规撤回</button>`);
+  }
+  btns.push(`<button data-act="audit" title="审计记录">审</button>`);
+  return `<span class="actions">${btns.join('')}</span>`;
+}
+
+function showAudit(m) {
+  $('auditTitle').textContent = `消息 #${m.seq} 的审计记录`;
+  const head = `<div class="ev"><div class="h">当前状态 · ${m.message.revokedAt ? '已撤回' : `v${m.message.version}${m.message.editedAt ? '（已编辑）' : ''}`}</div>
+    <div class="diff">${m.message.revokedAt ? '（正文已脱敏隐藏）' : escapeHtml(m.message.content || '')}</div></div>`;
+  $('auditList').innerHTML = head + m.events.map((e) => {
+    const t = new Date(e.ts).toLocaleString();
+    if (e.type === 'revoke') {
+      return `<div class="ev"><div class="h">撤回 · ${escapeHtml(e.byName || e.by)} · ${t}${e.reason ? ' · 原因：' + escapeHtml(e.reason) : ''}</div>
+        <div class="diff">撤回前原文：${escapeHtml(e.contentBefore || '')}</div></div>`;
+    }
+    return `<div class="ev"><div class="h">编辑 v${e.version} · ${escapeHtml(e.byName || e.by)} · ${t}${e.reason ? ' · 原因：' + escapeHtml(e.reason) : ''}</div>
+      <div class="diff">- ${escapeHtml(e.contentBefore || '')}\n+ ${escapeHtml(e.contentAfter || '')}</div></div>`;
+  }).join('');
+  $('auditMask').classList.remove('hidden');
+}
+
+$('auditClose').onclick = () => $('auditMask').classList.add('hidden');
+$('auditMask').onclick = (e) => { if (e.target === $('auditMask')) $('auditMask').classList.add('hidden'); };
+
+// 气泡按钮事件委托
+$('messages').onclick = (e) => {
+  const btn = e.target.closest('button, [data-act="audit"]');
+  if (!btn) return;
+  const act = btn.dataset.act;
+  if (act === 'audit') {
+    const bubble = e.target.closest('.msg');
+    if (bubble) send({ type: 'msg_audit', roomId: currentRoom, seq: Number(bubble.dataset.seq) });
+    return;
+  }
+  const bubble = btn.closest('.msg');
+  const seq = Number(bubble.dataset.seq);
+  const r = rooms.get(currentRoom);
+  const m = r.msgs.find((x) => x.seq === seq);
+  const opId = crypto.randomUUID();
+
+  if (act === 'edit') {
+    const text = prompt('编辑消息（服务端按版本号校验并发）', m.content);
+    if (text == null || text === m.content || !text.trim()) return;
+    const prev = { content: m.content, version: m.version || 1, editedAt: m.editedAt ?? null };
+    const frame = { type: 'edit_msg', roomId: currentRoom, seq, version: prev.version, opId, content: text.trim() };
+    r.ops.set(opId, { opId, kind: 'edit', seq, sentAt: Date.now(), frame, prev });
+    Object.assign(m, { content: text.trim(), version: prev.version + 1, editedAt: Date.now() }); // 乐观更新
+    send(frame); render();
+  } else if (act === 'revoke') {
+    if (!confirm('确定撤回这条消息？')) return;
+    const prev = { ...m };
+    const frame = { type: 'revoke_msg', roomId: currentRoom, seq, opId };
+    r.ops.set(opId, { opId, kind: 'revoke', seq, sentAt: Date.now(), frame, prev });
+    Object.assign(m, { revokedAt: Date.now(), revokedBy: me.userId, revokedByName: me.name, content: null });
+    send(frame); render();
+  } else if (act === 'admin-revoke') {
+    const reason = prompt('按违规处理撤回，请填写原因（将记入审计并广播）');
+    if (reason == null || !reason.trim()) return;
+    const prev = { ...m };
+    const frame = { type: 'revoke_msg', roomId: currentRoom, seq, opId, reason: reason.trim() };
+    r.ops.set(opId, { opId, kind: 'revoke', seq, sentAt: Date.now(), frame, prev });
+    Object.assign(m, { revokedAt: Date.now(), revokedBy: me.userId, revokedByName: me.name, revokeReason: reason.trim(), content: null });
+    send(frame); render();
+  }
+};
 
 // 把 members 响应接进渲染
 function renderMembers(list) {
@@ -288,7 +539,10 @@ $('loginForm').onsubmit = async (e) => {
   // 恢复房间进度
   const saved = store.load();
   for (const [id, info] of Object.entries(saved)) {
-    rooms.set(id, { name: info.name, msgs: [], pending: new Map(), lastSeenSeq: info.lastSeenSeq || 0 });
+    rooms.set(id, {
+      name: info.name, msgs: [], pending: new Map(), ops: new Map(),
+      lastSeenSeq: info.lastSeenSeq || 0, lastSeenRev: info.lastSeenRev || 0,
+    });
   }
   $('loginForm').classList.add('hidden');
   $('roomPanel').classList.remove('hidden');
@@ -305,7 +559,7 @@ $('createForm').onsubmit = (e) => {
 
 $('joinBtn').onclick = () => {
   const name = prompt('输入要加入的房间名');
-  if (name) send({ type: 'join', room: name, lastSeq: 0 });
+  if (name) send({ type: 'join', room: name, lastSeq: 0, lastRev: 0 });
 };
 
 $('composer').onsubmit = (e) => {
@@ -314,7 +568,7 @@ $('composer').onsubmit = (e) => {
   const cid = crypto.randomUUID();
   const r = rooms.get(currentRoom);
   r.pending.set(cid, { content, sentAt: Date.now(), acked: false });
-  r.msgs.push({ mine: true, fromName: me.name, content, seq: '…', pending: true, clientMsgId: cid });
+  r.msgs.push({ mine: true, from: me.userId, fromName: me.name, content, seq: '…', version: 1, pending: true, clientMsgId: cid });
   send({ type: 'msg', roomId: currentRoom, clientMsgId: cid, content });
   $('msgInput').value = '';
   render();

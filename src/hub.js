@@ -6,9 +6,14 @@ let nextConnId = 1;
 
 /**
  * 单条连接的运行时状态。
- * unacked: Map<roomId, Map<seq, {frame, lastSent, tries}>> —— 已推送但未被客户端
- * 累积 ACK 确认的消息，超时重发；这是「至少一次投递」的服务端正，配合客户端
- * 按 seq 去重（幂等消费）达到效果上的恰好一次。
+ *
+ * 两个相互独立的「推送 → 累积 ACK」空间：
+ * - unacked:       Map<roomId, Map<seq, entry>> 消息快照流，按 seq 累积 ACK；
+ * - unackedEvents: Map<roomId, Map<rev, entry>> 编辑/撤回事件流，按 rev 累积 ACK。
+ *
+ * 两条流分开追踪，是因为断线补发时消息按 seq 回放、事件按 rev 回放，游标语义不同
+ * （seq 有洞要补消息；rev 有洞要补事件）。超时重发、背压、断开重连等机制对两者一致：
+ * 至少一次投递 + 客户端幂等消费（消息按 seq 去重、事件按 rev 去重）。
  */
 class Connection {
   constructor(ws, user) {
@@ -20,41 +25,66 @@ class Connection {
     this.lastPong = now(); // 最近一次收到 pong 的时间，心跳判活依据
     this.rooms = new Set(); // 本连接已加入的房间
     this.unacked = new Map();
-    this.unackedCount = 0;
+    this.unackedEvents = new Map();
+    this.unackedCount = 0; // 两个空间的未确认条目总数（背压判定用）
+  }
+
+  _track(map, roomId, key, frame) {
+    let room = map.get(roomId);
+    if (!room) {
+      room = new Map();
+      map.set(roomId, room);
+    }
+    // 同键重入（重发后重新登记）不重复计数
+    if (!room.has(key)) this.unackedCount++;
+    room.set(key, { frame, lastSent: now(), tries: 0 });
   }
 
   trackUnacked(roomId, seq, frame) {
-    let room = this.unacked.get(roomId);
-    if (!room) {
-      room = new Map();
-      this.unacked.set(roomId, room);
-    }
-    room.set(seq, { frame, lastSent: now(), tries: 0 });
-    this.unackedCount++;
+    this._track(this.unacked, roomId, seq, frame);
   }
 
-  /** 累积 ACK：清除 roomId 下所有 seq <= ackSeq 的未确认项，返回新确认的数量 */
-  ack(roomId, ackSeq) {
-    const room = this.unacked.get(roomId);
+  trackUnackedEvent(roomId, rev, frame) {
+    this._track(this.unackedEvents, roomId, rev, frame);
+  }
+
+  /** 通用累积清除：清掉 room 内所有 key <= ackKey 的项，返回清除数量 */
+  static _cumulativeAck(map, roomId, ackKey, counter) {
+    const room = map.get(roomId);
     if (!room) return 0;
     let cleared = 0;
-    for (const seq of room.keys()) {
-      if (seq <= ackSeq) {
-        room.delete(seq);
+    for (const key of room.keys()) {
+      if (key <= ackKey) {
+        room.delete(key);
         cleared++;
       }
     }
-    if (room.size === 0) this.unacked.delete(roomId);
+    if (room.size === 0) map.delete(roomId);
+    return cleared;
+  }
+
+  /** 累积 ACK 消息：清除 roomId 下所有 seq <= ackSeq 的未确认项，返回清除数量 */
+  ack(roomId, ackSeq) {
+    const cleared = Connection._cumulativeAck(this.unacked, roomId, ackSeq);
     this.unackedCount -= cleared;
     return cleared;
   }
 
-  /** 摘出所有超时未确认、需要重发的条目 */
+  /** 累积 ACK 事件：清除 roomId 下所有 rev <= ackRev 的未确认项 */
+  ackEvent(roomId, ackRev) {
+    const cleared = Connection._cumulativeAck(this.unackedEvents, roomId, ackRev);
+    this.unackedCount -= cleared;
+    return cleared;
+  }
+
+  /** 摘出所有超时未确认、需要重发的条目（消息流 + 事件流） */
   *pendingResends(staleMs) {
     const t = now();
-    for (const room of this.unacked.values()) {
-      for (const entry of room.values()) {
-        if (t - entry.lastSent >= staleMs) yield entry;
+    for (const map of [this.unacked, this.unackedEvents]) {
+      for (const room of map.values()) {
+        for (const entry of room.values()) {
+          if (t - entry.lastSent >= staleMs) yield entry;
+        }
       }
     }
   }
@@ -99,6 +129,7 @@ class Hub {
     for (const roomId of conn.rooms) this._leaveRoomSet(roomId, conn);
     conn.rooms.clear();
     conn.unacked.clear();
+    conn.unackedEvents.clear();
     conn.unackedCount = 0;
   }
 
@@ -116,10 +147,9 @@ class Hub {
     this._leaveRoomSet(roomId, conn);
     conn.rooms.delete(roomId);
     const room = conn.unacked.get(roomId);
-    if (room) {
-      conn.unackedCount -= room.size;
-      conn.unacked.delete(roomId);
-    }
+    const evRoom = conn.unackedEvents.get(roomId);
+    if (room) { conn.unackedCount -= room.size; conn.unacked.delete(roomId); }
+    if (evRoom) { conn.unackedCount -= evRoom.size; conn.unackedEvents.delete(roomId); }
   }
 
   _leaveRoomSet(roomId, conn) {
@@ -138,10 +168,12 @@ class Hub {
   }
 
   /**
-   * 发送单帧到指定连接。track=true 时登记未 ACK 追踪（用于 msg 类帧）。
-   * 背压：未确认积压超过上限时断开连接（客户端重连后走 sync 补发）。
+   * 发送单帧到指定连接。track=true 时登记未 ACK 追踪：
+   * - seq != null：消息流未确认项（客户端用 seq 累积 ACK）；
+   * - rev != null：事件流未确认项（客户端用 rev 累积 ACK）。
+   * 背压：两个空间的未确认积压合计超过上限时断开连接（客户端重连后走 sync 补发）。
    */
-  send(conn, frame, { track = false, roomId = null, seq = null } = {}) {
+  send(conn, frame, { track = false, roomId = null, seq = null, rev = null } = {}) {
     if (conn.ws.readyState !== 1 /* OPEN */) return false;
     if (track && conn.unackedCount >= this.config.maxUnackedPerConn) {
       conn.ws.close(1013, 'backpressure: too many unacked messages');
@@ -154,17 +186,21 @@ class Hub {
       return false;
     }
     if (track && roomId != null && seq != null) conn.trackUnacked(roomId, seq, str);
+    else if (track && roomId != null && rev != null) conn.trackUnackedEvent(roomId, rev, str);
     return true;
   }
 
-  /** 广播到房间所有连接（含发送者的其他设备）。frame 只序列化一次。 */
-  broadcast(roomId, frame, { track = false, seq = null } = {}) {
+  /**
+   * 广播到房间所有连接（含发送者的其他设备）。frame 只序列化一次。
+   * seq/rev 的含义与 send 相同，决定该帧登记到哪个未确认空间。
+   */
+  broadcast(roomId, frame, { track = false, seq = null, rev = null } = {}) {
     const set = this.byRoom.get(roomId);
     if (!set) return 0;
     const str = JSON.stringify(frame);
     let delivered = 0;
     for (const conn of set) {
-      if (this.send(conn, str, { track, roomId, seq })) delivered++;
+      if (this.send(conn, str, { track, roomId, seq, rev })) delivered++;
     }
     return delivered;
   }
@@ -183,7 +219,7 @@ class Hub {
     }
   }
 
-  /** 重发扫描：超时未 ACK 的消息重发；超过最大重发次数判定连接不可用，断开让客户端重连补发 */
+  /** 重发扫描：超时未 ACK 的消息/事件重发；超过最大重发次数判定连接不可用，断开让客户端重连补发 */
   resendSweep() {
     const { ackResendAfterMs, ackMaxResend } = this.config;
     for (const conn of this.all) {

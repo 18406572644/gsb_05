@@ -101,8 +101,8 @@ async function createRoom(client, name) {
   return joined.roomId;
 }
 
-async function joinRoom(client, room, lastSeq = 0) {
-  client.send({ type: 'join', room, lastSeq });
+async function joinRoom(client, room, lastSeq = 0, lastRev = 0) {
+  client.send({ type: 'join', room, lastSeq, lastRev });
   return client.waitFor((m) => m.type === 'joined');
 }
 
@@ -440,6 +440,370 @@ test('持久化：服务重启后消息不丢失', async () => {
       await a.waitFor((m) => m.type === 'sync_done' && m.roomId === roomId);
       assert.deepEqual(a.roomSeqs(roomId), [1, 2, 3], '重启后历史消息完整可补发');
       await a.close();
+      server.stop();
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ============================================================ 编辑 / 撤回 / 审计
+
+async function sendMsg(client, roomId, cid, content) {
+  client.send({ type: 'msg', roomId, clientMsgId: cid, content });
+  return client.waitFor((m) => m.type === 'ack' && m.clientMsgId === cid);
+}
+
+const editedEvents = (client, roomId) =>
+  client.log.filter((m) => m.type === 'msg_edited' && m.roomId === roomId);
+const revokedEvents = (client, roomId) =>
+  client.log.filter((m) => m.type === 'msg_revoked' && m.roomId === roomId);
+
+async function historyOnce(client, roomId, beforeSeq) {
+  client.send({ type: 'history', roomId, beforeSeq, limit: 50 });
+  return client.waitFor((m) => m.type === 'history' && m.roomId === roomId);
+}
+
+test('编辑自己的消息：版本号递增，广播 msg_edited，历史读到新内容', async () => {
+  const { server, port } = await startServer();
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token);
+    const b = await Client.connect(port, ub.token);
+    const roomId = await createRoom(a, 'general');
+    await joinRoom(b, roomId);
+    await sendMsg(a, roomId, 'm1', 'orig');
+
+    a.send({ type: 'edit_msg', roomId, seq: 1, version: 1, opId: 'e1', content: 'fixed' });
+    const ea = await a.waitFor((m) => m.type === 'edit_ack' && m.opId === 'e1');
+    assert.equal(ea.rev, 1);
+    assert.equal(ea.version, 2);
+
+    const ev = await b.waitFor((m) => m.type === 'msg_edited' && m.seq === 1);
+    assert.equal(ev.rev, 1);
+    assert.equal(ev.version, 2);
+    assert.equal(ev.content, 'fixed');
+    assert.equal(ev.by, ua.userId);
+
+    const h = await historyOnce(b, roomId, 100);
+    const stored = h.messages.find((x) => x.seq === 1);
+    assert.equal(stored.content, 'fixed');
+    assert.equal(stored.version, 2);
+    assert.ok(stored.editedAt > 0);
+    assert.equal(stored.revokedAt, null);
+    await a.close();
+    await b.close();
+  } finally {
+    server.stop();
+  }
+});
+
+test('权限：不能编辑/撤回他人消息；管理员撤回违规消息必须填原因', async () => {
+  const { server, port } = await startServer();
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token);
+    const b = await Client.connect(port, ub.token);
+    const roomId = await createRoom(a, 'general');
+    await joinRoom(b, roomId);
+    await sendMsg(a, roomId, 'm0', 'admin message'); // seq 1 是管理员 alice 的
+    await sendMsg(b, roomId, 'm1', 'spammy content'); // seq 2 是 bob 的违规消息
+
+    // 普通成员不能动他人消息（管理员的也不行）
+    b.send({ type: 'edit_msg', roomId, seq: 1, version: 1, opId: 'x1', content: 'hacked' });
+    let err = await b.waitFor((m) => m.type === 'error');
+    assert.equal(err.code, 'FORBIDDEN');
+    b.send({ type: 'revoke_msg', roomId, seq: 1, opId: 'x2' });
+    err = await b.waitFor((m) => m.type === 'error');
+    assert.equal(err.code, 'FORBIDDEN');
+
+    // 管理员可处理违规消息，但必须填写原因
+    a.send({ type: 'revoke_msg', roomId, seq: 2, opId: 'x3' });
+    err = await a.waitFor((m) => m.type === 'error');
+    assert.equal(err.code, 'BAD_REQUEST');
+
+    a.send({ type: 'revoke_msg', roomId, seq: 2, opId: 'x4', reason: '广告骚扰' });
+    const ack = await a.waitFor((m) => m.type === 'revoke_ack' && m.opId === 'x4');
+    assert.equal(ack.seq, 2);
+    assert.ok(ack.revokedAt);
+    const ev = await b.waitFor((m) => m.type === 'msg_revoked' && m.seq === 2);
+    assert.equal(ev.reason, '广告骚扰');
+    assert.equal(ev.by, ua.userId);
+
+    // 历史翻页看到「已撤回」占位：正文脱敏，撤回人与原因保留
+    const h = await historyOnce(b, roomId, 100);
+    const stored = h.messages.find((x) => x.seq === 2);
+    assert.equal(stored.content, null);
+    assert.equal(stored.revokedBy, ua.userId);
+    assert.equal(stored.revokeReason, '广告骚扰');
+    assert.ok(stored.revokedAt > 0);
+    await a.close();
+    await b.close();
+  } finally {
+    server.stop();
+  }
+});
+
+test('版本冲突：基于旧版本的编辑被拒，错误帧带回服务端当前态', async () => {
+  const { server, port } = await startServer();
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token);
+    const b = await Client.connect(port, ub.token);
+    const roomId = await createRoom(a, 'general');
+    await joinRoom(b, roomId);
+    await sendMsg(a, roomId, 'm1', 'v1');
+
+    a.send({ type: 'edit_msg', roomId, seq: 1, version: 1, opId: 'e1', content: 'v2' });
+    await a.waitFor((m) => m.type === 'edit_ack' && m.opId === 'e1');
+    await b.waitFor((m) => m.type === 'msg_edited' && m.rev === 1);
+
+    // 迟到的旧操作（仍以为 version=1）—— 不得覆盖新状态
+    a.send({ type: 'edit_msg', roomId, seq: 1, version: 1, opId: 'e2', content: 'stale' });
+    const err = await a.waitFor((m) => m.type === 'error' && m.code === 'VERSION_CONFLICT');
+    assert.equal(err.current.version, 2);
+    assert.equal(err.current.content, 'v2');
+
+    await sleep(200);
+    assert.equal(editedEvents(b, roomId).length, 1, '冲突操作不产生事件、不广播');
+    const h = await historyOnce(a, roomId, 100);
+    assert.equal(h.messages[0].content, 'v2', '旧版本操作没有覆盖新内容');
+    await a.close();
+    await b.close();
+  } finally {
+    server.stop();
+  }
+});
+
+test('撤回是终态：撤回后拒绝编辑；重复撤回幂等，不重复广播', async () => {
+  const { server, port } = await startServer();
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token);
+    const b = await Client.connect(port, ub.token);
+    const roomId = await createRoom(a, 'general');
+    await joinRoom(b, roomId);
+    await sendMsg(a, roomId, 'm1', 'bye');
+
+    // 同 opId 重发（网络重试）：返回成功但只广播一次
+    a.send({ type: 'revoke_msg', roomId, seq: 1, opId: 'r1' });
+    await a.waitFor((m) => m.type === 'revoke_ack' && m.opId === 'r1');
+    await b.waitFor((m) => m.type === 'msg_revoked' && m.seq === 1);
+    a.send({ type: 'revoke_msg', roomId, seq: 1, opId: 'r1' });
+    await a.waitFor((m) => m.type === 'revoke_ack' && m.opId === 'r1');
+
+    // 换新 opId 撤回已撤回消息：幂等成功（rev=null 表示没有新事件），不广播
+    a.send({ type: 'revoke_msg', roomId, seq: 1, opId: 'r2' });
+    const ack2 = await a.waitFor((m) => m.type === 'revoke_ack' && m.opId === 'r2');
+    assert.equal(ack2.rev, null);
+
+    // 撤回后编辑被终态拒绝
+    a.send({ type: 'edit_msg', roomId, seq: 1, version: 1, opId: 'e1', content: 'reborn' });
+    const err = await a.waitFor((m) => m.type === 'error');
+    assert.equal(err.code, 'MESSAGE_REVOKED');
+
+    await sleep(200);
+    assert.equal(revokedEvents(b, roomId).length, 1, '撤回只广播一次');
+    assert.equal(editedEvents(b, roomId).length, 0);
+    await a.close();
+    await b.close();
+  } finally {
+    server.stop();
+  }
+});
+
+test('断线补发事件流：离线期间的编辑与撤回按 rev 补齐，与消息快照结果一致', async () => {
+  const { server, port } = await startServer();
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token);
+    let b = await Client.connect(port, ub.token);
+    const roomId = await createRoom(a, 'general');
+    await joinRoom(b, roomId);
+    await sendMsg(a, roomId, 'm1', 'one');
+    await b.waitFor((m) => m.type === 'msg' && m.seq === 1);
+    await b.close();
+
+    // 离线期间：新消息 -> 编辑 -> 撤回
+    await sendMsg(a, roomId, 'm2', 'two');
+    a.send({ type: 'edit_msg', roomId, seq: 2, version: 1, opId: 'e1', content: 'two-fixed' });
+    await a.waitFor((m) => m.type === 'edit_ack' && m.opId === 'e1');
+    a.send({ type: 'revoke_msg', roomId, seq: 2, opId: 'r1', reason: '误发' });
+    await a.waitFor((m) => m.type === 'revoke_ack' && m.opId === 'r1');
+
+    b = await Client.connect(port, ub.token);
+    await joinRoom(b, roomId, 1, 0); // lastSeq=1, lastRev=0
+    const done = await b.waitFor((m) => m.type === 'sync_done' && m.roomId === roomId);
+    assert.equal(done.lastSeq, 2);
+    assert.equal(done.lastRev, 2);
+    assert.equal(done.hasMore, false);
+
+    // 消息快照已是撤回终态（正文脱敏）
+    const snap = b.log.find((m) => m.type === 'msg' && m.seq === 2);
+    assert.equal(snap.content, null);
+    assert.equal(snap.revokedAt > 0, true);
+    assert.equal(snap.version, 2);
+    // 事件流完整：rev 1 编辑、rev 2 撤回，按序到达
+    assert.deepEqual(editedEvents(b, roomId).map((e) => e.rev), [1]);
+    assert.deepEqual(revokedEvents(b, roomId).map((e) => e.rev), [2]);
+    assert.equal(revokedEvents(b, roomId)[0].reason, '误发');
+    await a.close();
+    await b.close();
+  } finally {
+    server.stop();
+  }
+});
+
+test('事件帧同样走未 ACK 重发，收到 rev 累积 ACK 后停止', async () => {
+  const { server, port } = await startServer({
+    ackResendIntervalMs: 50,
+    ackResendAfterMs: 100,
+    ackMaxResend: 10,
+  });
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token);
+    const b = await Client.connect(port, ub.token);
+    const roomId = await createRoom(a, 'general');
+    await joinRoom(b, roomId);
+    await sendMsg(a, roomId, 'm1', 'hi');
+    await b.waitFor((m) => m.type === 'msg' && m.seq === 1);
+
+    a.send({ type: 'edit_msg', roomId, seq: 1, version: 1, opId: 'e1', content: 'hi2' });
+    await b.waitFor((m) => m.type === 'msg_edited' && m.rev === 1);
+    // 不 ACK，等服务端按 rev 重发事件帧
+    await b.waitFor((m) => m.type === 'msg_edited' && m.rev === 1, 2000);
+    assert.ok(editedEvents(b, roomId).length >= 2, '事件帧应被重发');
+
+    b.send({ type: 'ack', roomId, seq: 1, rev: 1 });
+    await sleep(100);
+    const count = editedEvents(b, roomId).length;
+    await sleep(400);
+    assert.equal(editedEvents(b, roomId).length, count, 'rev ACK 后事件不再重发');
+    await a.close();
+    await b.close();
+  } finally {
+    server.stop();
+  }
+});
+
+test('审计记录：msg_audit 返回历次编辑前后原文与撤回原因', async () => {
+  const { server, port } = await startServer();
+  try {
+    const u = await login(port, 'alice');
+    const a = await Client.connect(port, u.token);
+    const roomId = await createRoom(a, 'audit');
+    await sendMsg(a, roomId, 'm1', 'first');
+    a.send({ type: 'edit_msg', roomId, seq: 1, version: 1, opId: 'e1', content: 'second' });
+    await a.waitFor((m) => m.type === 'edit_ack' && m.opId === 'e1');
+    a.send({ type: 'edit_msg', roomId, seq: 1, version: 2, opId: 'e2', content: 'third' });
+    await a.waitFor((m) => m.type === 'edit_ack' && m.opId === 'e2');
+    a.send({ type: 'revoke_msg', roomId, seq: 1, opId: 'r1', reason: '包含错误信息' });
+    await a.waitFor((m) => m.type === 'revoke_ack' && m.opId === 'r1');
+
+    a.send({ type: 'msg_audit', roomId, seq: 1 });
+    const au = await a.waitFor((m) => m.type === 'msg_audit' && m.seq === 1);
+    // 当前快照正文已脱敏
+    assert.equal(au.message.content, null);
+    assert.equal(au.message.revokeReason, '包含错误信息');
+    // 完整事件链：两次编辑 + 撤回，按 rev 升序，原文全部保留
+    assert.deepEqual(au.events.map((e) => e.type), ['edit', 'edit', 'revoke']);
+    assert.deepEqual(au.events.map((e) => e.version), [2, 3, 3]);
+    assert.equal(au.events[0].contentBefore, 'first');
+    assert.equal(au.events[0].contentAfter, 'second');
+    assert.equal(au.events[1].contentBefore, 'second');
+    assert.equal(au.events[1].contentAfter, 'third');
+    assert.equal(au.events[2].contentBefore, 'third', '撤回事件保留被撤回原文');
+    assert.equal(au.events[2].contentAfter, null);
+    assert.equal(au.events[2].reason, '包含错误信息');
+    await a.close();
+  } finally {
+    server.stop();
+  }
+});
+
+test('持久化：重启后编辑/撤回状态与事件流仍可补发', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-test-edit-'));
+  const dbPath = path.join(dir, 'test.db');
+  try {
+    let token, roomId;
+    {
+      const { server, port } = await startServer({ dbPath });
+      const u = await login(port, 'alice');
+      token = u.token;
+      const a = await Client.connect(port, token);
+      roomId = await createRoom(a, 'persist');
+      await sendMsg(a, roomId, 'm1', 'before');
+      a.send({ type: 'edit_msg', roomId, seq: 1, version: 1, opId: 'e1', content: 'after' });
+      await a.waitFor((m) => m.type === 'edit_ack' && m.opId === 'e1');
+      await a.close();
+      server.stop();
+    }
+    {
+      const { server, port } = await startServer({ dbPath });
+      const a = await Client.connect(port, token);
+      await joinRoom(a, roomId, 0, 0);
+      await a.waitFor((m) => m.type === 'sync_done');
+      const snap = a.log.find((m) => m.type === 'msg' && m.seq === 1);
+      assert.equal(snap.content, 'after');
+      assert.equal(snap.version, 2);
+      const ev = a.log.find((m) => m.type === 'msg_edited' && m.seq === 1);
+      assert.ok(ev, '事件流重启后仍可按 rev 补发');
+      assert.equal(ev.content, 'after');
+      await a.close();
+      server.stop();
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('旧库迁移：无版本/事件列的老数据库升级后支持编辑与撤回', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-old-'));
+  const dbPath = path.join(dir, 'old.db');
+  try {
+    // 手工构造升级前的老 schema
+    const { DatabaseSync } = require('node:sqlite');
+    const old = new DatabaseSync(dbPath);
+    old.exec(`
+      CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, token_random TEXT NOT NULL, created_at INTEGER NOT NULL);
+      CREATE TABLE rooms (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, created_by TEXT NOT NULL, created_at INTEGER NOT NULL, last_seq INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE members (room_id TEXT NOT NULL, user_id TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'member',
+        muted_until INTEGER NOT NULL DEFAULT 0, joined_at INTEGER NOT NULL, PRIMARY KEY (room_id, user_id));
+      CREATE TABLE messages (room_id TEXT NOT NULL, seq INTEGER NOT NULL, client_msg_id TEXT NOT NULL,
+        sender_id TEXT NOT NULL, content TEXT NOT NULL, ts INTEGER NOT NULL,
+        PRIMARY KEY (room_id, seq), UNIQUE (room_id, sender_id, client_msg_id));
+      CREATE TABLE cursors (room_id TEXT NOT NULL, user_id TEXT NOT NULL, last_ack_seq INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL, PRIMARY KEY (room_id, user_id));
+    `);
+    old.close();
+
+    const { server, port } = await startServer({ dbPath });
+    try {
+      const u = await login(port, 'oliver');
+      const c = await Client.connect(port, u.token);
+      const roomId = await createRoom(c, 'old-room');
+      const ack = await sendMsg(c, roomId, 'm1', 'legacy message');
+
+      // 新列已通过 ALTER 补齐：编辑、撤回均可用
+      c.send({ type: 'edit_msg', roomId, seq: ack.seq, version: 1, opId: 'e1', content: 'edited on migrated db' });
+      const ea = await c.waitFor((m) => m.type === 'edit_ack' && m.opId === 'e1');
+      assert.equal(ea.version, 2);
+      c.send({ type: 'revoke_msg', roomId, seq: ack.seq, opId: 'r1' });
+      const ra = await c.waitFor((m) => m.type === 'revoke_ack' && m.opId === 'r1');
+      assert.ok(ra.revokedAt);
+
+      // 老 cursors 表也已升级，双游标 ACK 不报错
+      c.send({ type: 'ack', roomId, seq: ack.seq, rev: 2 });
+      await sleep(100);
+      await c.close();
+    } finally {
       server.stop();
     }
   } finally {

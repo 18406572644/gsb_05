@@ -51,7 +51,7 @@ class TokenBucket {
   }
 }
 
-/** 数据库消息行 -> 下发帧 */
+/** 数据库消息行 -> 下发帧（撤回消息在 db 层已把 content 脱敏为 null） */
 function msgFrame(m) {
   return {
     type: 'msg',
@@ -62,7 +62,33 @@ function msgFrame(m) {
     fromName: m.fromName,
     content: m.content,
     ts: m.ts,
+    version: m.version ?? 1,
+    editedAt: m.editedAt ?? null,
+    revokedAt: m.revokedAt ?? null,
+    revokedBy: m.revokedBy ?? null,
+    revokedByName: m.revokedByName ?? null,
+    revokeReason: m.revokeReason ?? null,
   };
+}
+
+/** 审计事件行 -> 下发帧。编辑/撤回前的原文（contentBefore）不随事件流下发，只走 msg_audit */
+function eventFrame(e) {
+  const base = {
+    type: e.type === 'edit' ? 'msg_edited' : 'msg_revoked',
+    roomId: e.roomId,
+    rev: e.rev,
+    seq: e.seq,
+    version: e.version,
+    by: e.actorId,
+    byName: e.actorName,
+    reason: e.reason ?? null,
+    ts: e.ts,
+  };
+  if (e.type === 'edit') {
+    base.content = e.contentAfter;
+    base.editedAt = e.editedAt;
+  }
+  return base;
 }
 
 function createChatServer(overrides = {}) {
@@ -74,14 +100,37 @@ function createChatServer(overrides = {}) {
 
   // ---------------------------------------------------------------- 消息处理
 
-  /** 断线补发：把 roomId 中 seq > fromSeq 的消息按序推给连接，分批，客户端按 sync_done 续拉 */
-  function replayRoom(conn, roomId, fromSeq) {
-    const batch = db.getMessagesAfter(roomId, fromSeq, config.syncBatchSize + 1);
-    const hasMore = batch.length > config.syncBatchSize;
-    const slice = hasMore ? batch.slice(0, config.syncBatchSize) : batch;
-    for (const m of slice) hub.send(conn, msgFrame(m), { track: true, roomId, seq: m.seq });
-    const lastSeq = slice.length ? slice[slice.length - 1].seq : fromSeq;
-    hub.send(conn, { type: 'sync_done', roomId, lastSeq, hasMore });
+  /**
+   * 断线补发：双流回放。
+   * 1) 先按 seq 补消息快照（快照即最新态：已编辑内容 / 已撤回占位）；
+   * 2) 消息追平后再按 rev 补编辑/撤回事件——客户端按 version/rev 幂等应用，
+   *    事件不会把已为新态的快照回滚成旧态；
+   * 3) 一个 sync_done 同时携带两个游标，hasMore 时客户端续拉。
+   */
+  function replayRoom(conn, roomId, fromSeq, fromRev) {
+    const msgBatch = db.getMessagesAfter(roomId, fromSeq, config.syncBatchSize + 1);
+    const msgsHasMore = msgBatch.length > config.syncBatchSize;
+    const msgs = msgsHasMore ? msgBatch.slice(0, config.syncBatchSize) : msgBatch;
+    for (const m of msgs) hub.send(conn, msgFrame(m), { track: true, roomId, seq: m.seq });
+    const lastSeq = msgs.length ? msgs[msgs.length - 1].seq : fromSeq;
+
+    let lastRev = fromRev;
+    let eventsHasMore = false;
+    if (!msgsHasMore) {
+      const evBatch = db.getEventsAfter(roomId, fromRev, config.syncBatchSize + 1);
+      eventsHasMore = evBatch.length > config.syncBatchSize;
+      const events = eventsHasMore ? evBatch.slice(0, config.syncBatchSize) : evBatch;
+      for (const e of events) hub.send(conn, eventFrame(e), { track: true, roomId, rev: e.rev });
+      lastRev = events.length ? events[events.length - 1].rev : fromRev;
+    }
+
+    hub.send(conn, {
+      type: 'sync_done',
+      roomId,
+      lastSeq,
+      lastRev,
+      hasMore: msgsHasMore || eventsHasMore,
+    });
   }
 
   function requireMember(conn, roomId) {
@@ -130,10 +179,15 @@ function createChatServer(overrides = {}) {
         role: member.role,
         mutedUntil: member.muted_until,
         lastSeq: room.last_seq,
+        lastEventRev: room.last_event_rev,
       });
       // 补发：优先用客户端上报的进度，否则用服务端游标（新设备则从游标开始）
-      const fromSeq = Number.isInteger(msg.lastSeq) ? msg.lastSeq : db.getCursor(room.id, conn.userId);
-      if (fromSeq < room.last_seq) replayRoom(conn, room.id, fromSeq);
+      const cur = db.getCursor(room.id, conn.userId);
+      const fromSeq = Number.isInteger(msg.lastSeq) ? msg.lastSeq : cur.lastAckSeq;
+      const fromRev = Number.isInteger(msg.lastRev) ? msg.lastRev : cur.lastAckRev;
+      if (fromSeq < room.last_seq || fromRev < room.last_event_rev) {
+        replayRoom(conn, room.id, fromSeq, fromRev);
+      }
     },
 
     leave(conn, msg) {
@@ -173,19 +227,32 @@ function createChatServer(overrides = {}) {
       }
     },
 
-    // 客户端累积 ACK：清除未确认队列 + 持久化游标（断线补发的兜底依据）
+    // 客户端累积 ACK：清除未确认队列 + 持久化双游标（断线补发的兜底依据）
+    // seq 确认消息流、rev 确认事件流；可同时上报，也可分别上报。
     ack(conn, msg) {
-      if (!isNonEmptyString(msg.roomId, 128) || !Number.isInteger(msg.seq)) return;
+      if (!isNonEmptyString(msg.roomId, 128)) return;
       if (!conn.rooms.has(msg.roomId)) return; // 只处理本连接已加入的房间
-      conn.ack(msg.roomId, msg.seq);
-      db.saveCursor(msg.roomId, conn.userId, msg.seq);
+      const hasSeq = Number.isInteger(msg.seq) && msg.seq >= 0;
+      const hasRev = Number.isInteger(msg.rev) && msg.rev >= 0;
+      if (!hasSeq && !hasRev) return;
+      if (hasSeq) conn.ack(msg.roomId, msg.seq);
+      if (hasRev) conn.ackEvent(msg.roomId, msg.rev);
+      const cur = db.getCursor(msg.roomId, conn.userId);
+      db.saveCursor(
+        msg.roomId,
+        conn.userId,
+        hasSeq ? msg.seq : cur.lastAckSeq,
+        hasRev ? msg.rev : cur.lastAckRev
+      );
     },
 
     sync(conn, msg) {
       if (!isNonEmptyString(msg.roomId, 128)) fail('BAD_REQUEST', 'invalid roomId');
       requireMember(conn, msg.roomId);
-      const fromSeq = Number.isInteger(msg.lastSeq) ? msg.lastSeq : db.getCursor(msg.roomId, conn.userId);
-      replayRoom(conn, msg.roomId, fromSeq);
+      const cur = db.getCursor(msg.roomId, conn.userId);
+      const fromSeq = Number.isInteger(msg.lastSeq) ? msg.lastSeq : cur.lastAckSeq;
+      const fromRev = Number.isInteger(msg.lastRev) ? msg.lastRev : cur.lastAckRev;
+      replayRoom(conn, msg.roomId, fromSeq, fromRev);
     },
 
     history(conn, msg) {
@@ -195,6 +262,154 @@ function createChatServer(overrides = {}) {
       const before = Number.isInteger(msg.beforeSeq) ? msg.beforeSeq : Number.MAX_SAFE_INTEGER;
       const messages = db.getMessagesBefore(msg.roomId, before, limit);
       hub.send(conn, { type: 'history', roomId: msg.roomId, messages, hasMore: messages.length === limit });
+    },
+
+    /**
+     * 编辑自己的消息（CAS）。
+     * 必须带 seq + version（客户端所见版本）+ opId（操作幂等）。
+     * 撤回是终态：已撤回消息拒绝编辑；版本不匹配返回 VERSION_CONFLICT + 服务端当前态，
+     * 由客户端合并刷新，旧操作不会覆盖新状态。
+     */
+    edit_msg(conn, msg) {
+      if (!isNonEmptyString(msg.roomId, 128)) fail('BAD_REQUEST', 'invalid roomId');
+      if (!Number.isInteger(msg.seq) || msg.seq <= 0) fail('BAD_REQUEST', 'invalid seq');
+      if (!Number.isInteger(msg.version) || msg.version < 1) fail('BAD_REQUEST', 'invalid version');
+      if (!isNonEmptyString(msg.opId, 64)) fail('BAD_REQUEST', 'invalid opId');
+      if (!isNonEmptyString(msg.content, config.maxContentLength)) {
+        fail('BAD_REQUEST', `content must be 1..${config.maxContentLength} chars`);
+      }
+      const member = requireMember(conn, msg.roomId);
+      if (member.muted_until > now()) fail('MUTED', 'you are muted');
+      if (!limiter.take(conn.userId)) fail('RATE_LIMITED', 'too many operations, slow down');
+
+      const target = db.getMessage(msg.roomId, msg.seq);
+      if (!target) fail('NO_SUCH_MESSAGE', 'message not found');
+      if (target.from !== conn.userId) fail('FORBIDDEN', 'you can only edit your own messages');
+
+      const r = db.editMessage({
+        roomId: msg.roomId,
+        seq: msg.seq,
+        content: msg.content,
+        expectedVersion: msg.version,
+        editorId: conn.userId,
+        opId: msg.opId,
+      });
+
+      if (r.status === 'not_found') fail('NO_SUCH_MESSAGE', 'message not found');
+      if (r.status === 'revoked') {
+        // 终态冲突同样回传权威当前态（已撤回占位），客户端直接覆盖本地
+        hub.send(conn, {
+          type: 'error',
+          code: 'MESSAGE_REVOKED',
+          message: 'message has been revoked and cannot be edited',
+          ref: msg.opId,
+          current: msgFrame(r.message),
+        });
+        return;
+      }
+      if (r.status === 'conflict') {
+        // 先回操作失败（带服务端当前态），让客户端覆盖本地旧版本
+        hub.send(conn, {
+          type: 'error',
+          code: 'VERSION_CONFLICT',
+          message: 'message was modified by a newer operation',
+          ref: msg.opId,
+          current: msgFrame(r.current),
+        });
+        return;
+      }
+
+      // ok / duplicate：都回 edit_ack（重试拿到同一 rev，操作幂等）
+      hub.send(conn, {
+        type: 'edit_ack',
+        roomId: msg.roomId,
+        seq: msg.seq,
+        opId: msg.opId,
+        rev: r.event.rev,
+        version: r.message.version,
+        editedAt: r.message.editedAt,
+      });
+      if (r.status === 'ok') {
+        hub.broadcast(msg.roomId, eventFrame(r.event), { track: true, rev: r.event.rev });
+      }
+    },
+
+    /**
+     * 撤回消息：本人可撤回自己的消息；管理员可按权限处理违规消息（需填原因）。
+     * 撤回为终态且幂等——重复撤回（同 opId 或消息已是撤回态）都成功返回，不重复广播。
+     */
+    revoke_msg(conn, msg) {
+      if (!isNonEmptyString(msg.roomId, 128)) fail('BAD_REQUEST', 'invalid roomId');
+      if (!Number.isInteger(msg.seq) || msg.seq <= 0) fail('BAD_REQUEST', 'invalid seq');
+      if (!isNonEmptyString(msg.opId, 64)) fail('BAD_REQUEST', 'invalid opId');
+      // 原因可选，但管理员审核处理违规消息时强制填写
+      if (msg.reason !== undefined && msg.reason !== null && !isNonEmptyString(msg.reason, 500)) {
+        fail('BAD_REQUEST', 'invalid reason');
+      }
+      const member = requireMember(conn, msg.roomId);
+      const target = db.getMessage(msg.roomId, msg.seq);
+      if (!target) fail('NO_SUCH_MESSAGE', 'message not found');
+
+      const isOwner = target.from === conn.userId;
+      const isAdmin = member.role === 'admin';
+      if (!isOwner && !isAdmin) fail('FORBIDDEN', 'you can only revoke your own messages');
+      // 管理员撤回他人消息 = 审核处理，必须给原因
+      if (isAdmin && !isOwner && !isNonEmptyString(msg.reason, 500)) {
+        fail('BAD_REQUEST', 'reason is required when an admin revokes another member\'s message');
+      }
+      if (member.muted_until > now() && !isAdmin) fail('MUTED', 'you are muted');
+      if (!limiter.take(conn.userId)) fail('RATE_LIMITED', 'too many operations, slow down');
+
+      const r = db.revokeMessage({
+        roomId: msg.roomId,
+        seq: msg.seq,
+        actorId: conn.userId,
+        opId: msg.opId,
+        reason: msg.reason ?? null,
+      });
+
+      if (r.status === 'not_found') fail('NO_SUCH_MESSAGE', 'message not found');
+
+      hub.send(conn, {
+        type: 'revoke_ack',
+        roomId: msg.roomId,
+        seq: msg.seq,
+        opId: msg.opId,
+        rev: r.event ? r.event.rev : null,
+        revokedAt: r.message.revokedAt,
+      });
+      if (r.status === 'ok') {
+        hub.broadcast(msg.roomId, eventFrame(r.event), { track: true, rev: r.event.rev });
+      }
+    },
+
+    /** 查看单条消息的完整审计记录（房间成员可见；含历次编辑的前后原文与撤回原因） */
+    msg_audit(conn, msg) {
+      if (!isNonEmptyString(msg.roomId, 128)) fail('BAD_REQUEST', 'invalid roomId');
+      if (!Number.isInteger(msg.seq) || msg.seq <= 0) fail('BAD_REQUEST', 'invalid seq');
+      requireMember(conn, msg.roomId);
+      const message = db.getMessage(msg.roomId, msg.seq);
+      if (!message) fail('NO_SUCH_MESSAGE', 'message not found');
+      const events = db.getAuditTrail(msg.roomId, msg.seq);
+      hub.send(conn, {
+        type: 'msg_audit',
+        roomId: msg.roomId,
+        seq: msg.seq,
+        message: msgFrame(message),
+        // 审计视图才下发历次原文；普通事件广播不含 contentBefore
+        events: events.map((e) => ({
+          rev: e.rev,
+          type: e.type,
+          by: e.actorId,
+          byName: e.actorName,
+          reason: e.reason ?? null,
+          version: e.version,
+          editedAt: e.editedAt ?? null,
+          contentBefore: e.contentBefore,
+          contentAfter: e.contentAfter,
+          ts: e.ts,
+        })),
+      });
     },
 
     rooms(conn) {
@@ -264,7 +479,7 @@ function createChatServer(overrides = {}) {
           type: 'error',
           code: err.code,
           message: err.message,
-          ref: msg.clientMsgId || msg.roomId || undefined,
+          ref: msg.opId || msg.clientMsgId || msg.roomId || undefined,
         });
       } else {
         console.error('[handler error]', msg.type, err);
