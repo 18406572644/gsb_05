@@ -27,6 +27,13 @@
   .msg.mine { background: #2f6fed; align-self: flex-end; }
   .msg .meta { font-size: 11px; opacity: .65; margin-bottom: 2px; }
   .msg .tick { font-size: 11px; opacity: .7; }
+  .msg .edited { font-size: 11px; opacity: .6; margin-left: 4px; }
+  .msg .acts { margin-top: 4px; display: none; gap: 6px; }
+  .msg:hover .acts { display: flex; }
+  .msg .acts button { padding: 1px 7px; font-size: 11px; background: transparent;
+                     border: 1px solid rgba(255,255,255,.35); color: inherit; }
+  .msg.recalled { opacity: .62; font-style: italic; background: #20243a; }
+  .msg.recalled .body { text-decoration: line-through; }
   .sys { align-self: center; font-size: 12px; color: #7f8db3; }
   #composer { display: flex; gap: 8px; padding: 12px 16px; background: #161d2e; }
   #composer input { flex: 1; }
@@ -65,6 +72,9 @@
 
   <div id="chat">
     <div id="messages"></div>
+    <div id="pager" class="hidden" style="text-align:center;padding:6px;background:#161d2e">
+      <button id="olderBtn" type="button" style="background:#2a3550;border-color:#2a3550">加载更早的消息</button>
+    </div>
     <form id="composer" class="hidden">
       <input id="msgInput" placeholder="发送消息…" autocomplete="off">
       <button type="submit">发送</button>
@@ -78,14 +88,17 @@
 'use strict';
 /* 可靠投递客户端协议实现：
  * - 发送：每条消息带唯一 clientMsgId，未收到 ACK 定时重发（服务端幂等去重）；
- * - 接收：按房间记录 lastSeenSeq，seq 小于等于它的一律丢弃（幂等消费）；
- * - ACK：累积确认，500ms 批量上报；
- * - 断线补发：重连后重新 join 并携带 lastSeenSeq，服务端回放缺口；
- * - lastSeenSeq 存 localStorage，刷新页面也不丢进度。
+ * - 接收：按房间记录消息水位 lastSeenSeq 与状态事件水位 lastSeenEventSeq，
+ *   seq/eventSeq 小于等于水位的一律丢弃（幂等消费）；
+ * - 编辑/撤回：msg_updated / msg_recalled 事件按 version 单调应用，旧版本事件不覆盖
+ *   新状态；VERSION_CONFLICT 错误携带最新视图直接收敛；
+ * - ACK：累积确认（双水位），500ms 批量上报；
+ * - 断线补发：重连后重新 join 并携带双水位，服务端分别回放消息缺口与事件缺口；
+ * - 水位存 localStorage，刷新页面也不丢进度。
  */
 const $ = (id) => document.getElementById(id);
 let ws = null, me = null, currentRoom = null;
-const rooms = new Map(); // roomId -> {name, role, mutedUntil, lastSeenSeq, msgs:[], pending:Map}
+const rooms = new Map(); // roomId -> {name, role, mutedUntil, lastSeenSeq, lastSeenEventSeq, msgs:[], pending:Map}
 let reconnectDelay = 500, ackTimer = null, retryTimer = null;
 
 const store = {
@@ -93,7 +106,9 @@ const store = {
   load() { try { return JSON.parse(localStorage.getItem(this.key())) || {}; } catch { return {}; } },
   save() {
     const o = {};
-    for (const [id, r] of rooms) o[id] = { name: r.name, lastSeenSeq: r.lastSeenSeq };
+    for (const [id, r] of rooms) {
+      o[id] = { name: r.name, lastSeenSeq: r.lastSeenSeq, lastSeenEventSeq: r.lastSeenEventSeq };
+    }
     localStorage.setItem(this.key(), JSON.stringify(o));
   },
 };
@@ -115,10 +130,14 @@ function connect() {
   ws = new WebSocket(`ws://${location.host}/ws?token=${encodeURIComponent(me.token)}`);
   ws.onopen = () => {
     setStatus('on', '已连接'); reconnectDelay = 500;
-    // 重连后恢复所有房间：携带本地进度，服务端补发缺口
+    // 重连后恢复所有房间：携带双水位，服务端补发消息与状态事件缺口
     const saved = store.load();
     for (const [roomId, info] of Object.entries(saved)) {
-      ws.send(JSON.stringify({ type: 'join', room: roomId, lastSeq: info.lastSeenSeq || 0 }));
+      ws.send(JSON.stringify({
+        type: 'join', room: roomId,
+        lastSeq: info.lastSeenSeq || 0,
+        lastEventSeq: info.lastSeenEventSeq || 0,
+      }));
     }
   };
   ws.onmessage = (ev) => handle(JSON.parse(ev.data));
@@ -132,14 +151,30 @@ function connect() {
 
 function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
 
+/** 按 seq 找到房间内消息（pending 占位除外） */
+function findMsg(r, seq) { return r.msgs.find((x) => x.seq === seq && !x.sys); }
+
+/** 以版本号单调地合并服务端消息视图（msg 帧/冲突 current 通用），旧版本不覆盖新状态 */
+function mergeMessage(r, m) {
+  const idx = r.msgs.findIndex((x) => x.seq === m.seq && !x.sys);
+  if (idx >= 0) {
+    const old = r.msgs[idx];
+    if ((old.version || 1) >= (m.version || 1)) return false;
+    r.msgs[idx] = { ...old, ...m, mine: old.mine };
+    return true;
+  }
+  return false;
+}
+
 function handle(m) {
   switch (m.type) {
     case 'welcome': break;
     case 'joined': {
       const saved = store.load();
-      const r = rooms.get(m.roomId) || { msgs: [], pending: new Map(), lastSeenSeq: 0 };
+      const r = rooms.get(m.roomId) || { msgs: [], pending: new Map(), lastSeenSeq: 0, lastSeenEventSeq: 0 };
       r.name = m.name; r.role = m.role; r.mutedUntil = m.mutedUntil;
       r.lastSeenSeq = Math.max(r.lastSeenSeq, saved[m.roomId]?.lastSeenSeq || 0);
+      r.lastSeenEventSeq = Math.max(r.lastSeenEventSeq, saved[m.roomId]?.lastSeenEventSeq || 0);
       rooms.set(m.roomId, r);
       if (!currentRoom) currentRoom = m.roomId;
       renderRooms(); render(); refreshMembers();
@@ -171,8 +206,67 @@ function handle(m) {
       render();
       break;
     }
+    case 'msg_updated':                            // 消息被编辑（实时广播或补发回放）
+    case 'msg_recalled': {                        // 消息被撤回（本人或管理员）
+      const r = rooms.get(m.roomId); if (!r) break;
+      if (m.eventSeq <= r.lastSeenEventSeq) break; // 事件幂等：重发/回放重复直接丢弃
+      const target = findMsg(r, m.seq);
+      if (target) {
+        // 版本单调：迟到的旧事件不能覆盖新状态（编辑与撤回/审核并发的最终一致性）
+        if ((m.version || 1) > (target.version || 1)) {
+          if (m.type === 'msg_updated') {
+            // 消息已撤回时，补发的历史 edit 事件不带正文（null），只用于保持事件流有序
+            if (typeof m.content === 'string') {
+              target.content = m.content;
+              target.editedAt = m.editedAt;
+            }
+          } else {
+            target.content = '';
+            target.recalled = true;
+            target.recalledAt = m.recalledAt;
+            target.recalledBy = m.recalledBy;
+            target.recalledByName = m.recalledByName;
+            target.recallReason = m.reason;
+          }
+          target.version = m.version;
+        }
+      }
+      r.lastSeenEventSeq = m.eventSeq;
+      store.save(); scheduleAck();
+      render();
+      break;
+    }
     case 'sync_done':
-      if (m.hasMore) send({ type: 'sync', roomId: m.roomId, lastSeq: m.lastSeq });
+      // 双水位分别推进；hasMore 时携带两个水位续拉
+      if (m.hasMore) {
+        const r = rooms.get(m.roomId);
+        send({
+          type: 'sync', roomId: m.roomId,
+          lastSeq: m.lastSeq,
+          lastEventSeq: m.lastEventSeq,
+        });
+        if (r) {
+          r.lastSeenSeq = Math.max(r.lastSeenSeq, m.lastSeq);
+          r.lastSeenEventSeq = Math.max(r.lastSeenEventSeq, m.lastEventSeq);
+          store.save();
+        }
+      }
+      break;
+    case 'history': {
+      const r = rooms.get(m.roomId); if (!r) break;
+      if (!m.messages.length) { r.hasMoreHistory = false; render(); break; }
+      // 去重后按升序插到最前（已撤回消息同样以占位帧返回，与实时/补发一致）
+      const have = new Set(r.msgs.filter((x) => !x.sys).map((x) => x.seq));
+      const fresh = m.messages
+        .filter((x) => !have.has(x.seq))
+        .map((x) => ({ ...x, mine: x.from === me.userId }));
+      r.msgs.unshift(...fresh);
+      r.hasMoreHistory = m.hasMore;
+      render();
+      break;
+    }
+    case 'revisions':
+      showRevisions(m);
       break;
     case 'notice': {
       const r = rooms.get(m.roomId);
@@ -185,7 +279,14 @@ function handle(m) {
       if (m.roomId === currentRoom) renderMembers(m.members);
       break;
     case 'error':
-      sys(currentRoom, `错误 [${m.code}] ${m.message}`);
+      if (m.code === 'VERSION_CONFLICT' && m.current) {
+        // 并发冲突：服务端给出最新视图，直接收敛（撤回占位/最新内容/版本号）
+        const r = rooms.get(m.current.roomId);
+        if (r && mergeMessage(r, { ...m.current, mine: m.current.from === me.userId })) render();
+        sys(currentRoom, `操作冲突：#${m.seq} 已被他人改动，已刷新为最新状态`);
+      } else {
+        sys(currentRoom, `错误 [${m.code}] ${m.message}`);
+      }
       break;
     case 'server_shutdown': sys(currentRoom, '服务器即将重启…'); break;
   }
@@ -195,7 +296,11 @@ function scheduleAck() {
   if (ackTimer) return;
   ackTimer = setTimeout(() => {
     ackTimer = null;
-    for (const [id, r] of rooms) if (r.lastSeenSeq > 0) send({ type: 'ack', roomId: id, seq: r.lastSeenSeq });
+    for (const [id, r] of rooms) {
+      if (r.lastSeenSeq > 0 || r.lastSeenEventSeq > 0) {
+        send({ type: 'ack', roomId: id, seq: r.lastSeenSeq, eventSeq: r.lastSeenEventSeq });
+      }
+    }
   }, 500);
 }
 
@@ -219,6 +324,17 @@ function sys(roomId, text) {
   r.msgs.push({ sys: text }); render();
 }
 
+/** 审计轨迹弹窗 */
+function showRevisions(m) {
+  const lines = [`消息 #${m.seq} 的审计记录（共 ${m.revisions.length} 个版本）：`];
+  for (const v of m.revisions) {
+    const tag = v.action === 'create' ? '创建' : v.action === 'edit' ? '编辑' : '撤回';
+    const base = `v${v.version} ${tag} · ${v.actorName} · ${new Date(v.ts).toLocaleString()}`;
+    lines.push(base + (v.reason ? ` · 原因：${v.reason}` : '') + (v.content != null ? `\n    「${v.content}」` : ''));
+  }
+  alert(lines.join('\n'));
+}
+
 function renderRooms() {
   $('roomList').innerHTML = [...rooms].map(([id, r]) =>
     `<div class="room ${id === currentRoom ? 'active' : ''}" data-id="${id}">
@@ -234,19 +350,86 @@ function render() {
   const r = rooms.get(currentRoom);
   $('composer').classList.toggle('hidden', !r);
   $('members').classList.toggle('hidden', !r);
+  const hasMsgs = r.msgs.some((x) => !x.sys && Number.isInteger(x.seq));
+  $('pager').classList.toggle('hidden', !r || r.hasMoreHistory === false || !hasMsgs);
   if (!r) return;
   const box = $('messages');
   box.innerHTML = r.msgs.map((m) => {
     if (m.sys) return `<div class="sys">${escapeHtml(m.sys)}</div>`;
     const tick = m.mine ? `<span class="tick">${m.pending ? '…' : '✓'}</span>` : '';
+
+    if (m.recalled) {
+      // 已撤回占位：位置、序号、撤回人、原因、操作时间全部保留，内容不可见
+      const who = m.recalledByName ? ` · ${escapeHtml(m.recalledByName)}` : '';
+      const title = m.recallReason ? ` title="原因：${escapeHtml(m.recallReason)}"` : '';
+      return `<div class="msg recalled ${m.mine ? 'mine' : ''}"${title}>
+        <div class="meta">#${m.seq} ${tick}</div>
+        <div class="body">消息已撤回${who} · ${new Date(m.recalledAt).toLocaleTimeString()}</div>
+        ${actsHtml(r, m)}
+      </div>`;
+    }
+
+    const edited = m.editedAt
+      ? `<span class="edited" title="编辑于 ${new Date(m.editedAt).toLocaleString()}">已编辑</span>` : '';
     return `<div class="msg ${m.mine ? 'mine' : ''}">
-      <div class="meta">${escapeHtml(m.fromName || '')} · #${m.seq} ${tick}</div>
-      <div>${escapeHtml(m.content)}</div></div>`;
+      <div class="meta">${escapeHtml(m.fromName || '')} · #${m.seq} ${tick}${edited}</div>
+      <div class="body">${escapeHtml(m.content)}</div>
+      ${actsHtml(r, m)}
+    </div>`;
   }).join('');
   box.scrollTop = box.scrollHeight;
+  bindActs(r);
   const muted = r.mutedUntil > Date.now();
   $('msgInput').placeholder = muted ? `你已被禁言至 ${new Date(r.mutedUntil).toLocaleTimeString()}` : '发送消息…';
   $('msgInput').disabled = muted;
+}
+
+/** 操作按钮：本人可编辑/撤回；管理员可撤回成员违规消息（须填原因）；成员均可查审计 */
+function actsHtml(r, m) {
+  if (!Number.isInteger(m.seq) || m.pending) return '';
+  const btns = [`<button data-act="revisions" data-seq="${m.seq}">记录</button>`];
+  if (!m.recalled && m.mine) {
+    btns.push(`<button data-act="edit" data-seq="${m.seq}">编辑</button>`);
+    btns.push(`<button data-act="recall" data-seq="${m.seq}">撤回</button>`);
+  } else if (!m.recalled && r.role === 'admin' && !m.mine) {
+    btns.push(`<button data-act="admin-recall" data-seq="${m.seq}">管理员撤回</button>`);
+  }
+  return `<div class="acts">${btns.join('')}</div>`;
+}
+
+function bindActs(r) {
+  $('messages').querySelectorAll('.msg .acts button').forEach((b) => {
+    b.onclick = () => onAct(b.dataset.act, Number(b.dataset.seq), r);
+  });
+}
+
+function onAct(act, seq, r) {
+  if (!Number.isInteger(seq)) return;
+  const m = findMsg(r, seq);
+  if (act === 'revisions') {
+    send({ type: 'revisions', roomId: currentRoom, seq });
+    return;
+  }
+  if (act === 'edit') {
+    const content = prompt('编辑消息（旧操作若与他人的改动冲突会被拒绝）', m.content);
+    if (content == null) return;
+    const text = content.trim();
+    if (!text) return;
+    send({ type: 'edit', roomId: currentRoom, seq, version: m.version || 1, content: text });
+    return;
+  }
+  if (act === 'recall') {
+    if (!confirm('确定撤回这条消息？撤回后历史记录中将保留占位。')) return;
+    send({ type: 'recall', roomId: currentRoom, seq, version: m.version || 1 });
+    return;
+  }
+  if (act === 'admin-recall') {
+    const reason = prompt('管理员撤回违规消息，请填写原因（将记入审计）');
+    if (reason == null) return;
+    const text = reason.trim();
+    if (!text) { alert('管理员撤回必须填写原因'); return; }
+    send({ type: 'recall', roomId: currentRoom, seq, version: m.version || 1, reason: text });
+  }
 }
 
 // 把 members 响应接进渲染
@@ -285,10 +468,14 @@ $('loginForm').onsubmit = async (e) => {
   e.preventDefault();
   const name = $('nameInput').value.trim(); if (!name) return;
   me = await login(name);
-  // 恢复房间进度
+  // 恢复房间进度（双水位）
   const saved = store.load();
   for (const [id, info] of Object.entries(saved)) {
-    rooms.set(id, { name: info.name, msgs: [], pending: new Map(), lastSeenSeq: info.lastSeenSeq || 0 });
+    rooms.set(id, {
+      name: info.name, msgs: [], pending: new Map(),
+      lastSeenSeq: info.lastSeenSeq || 0,
+      lastSeenEventSeq: info.lastSeenEventSeq || 0,
+    });
   }
   $('loginForm').classList.add('hidden');
   $('roomPanel').classList.remove('hidden');
@@ -305,7 +492,15 @@ $('createForm').onsubmit = (e) => {
 
 $('joinBtn').onclick = () => {
   const name = prompt('输入要加入的房间名');
-  if (name) send({ type: 'join', room: name, lastSeq: 0 });
+  if (name) send({ type: 'join', room: name, lastSeq: 0, lastEventSeq: 0 });
+};
+
+// 历史翻页：以当前最小 seq 为游标向前拉，撤回消息同样以占位返回
+$('olderBtn').onclick = () => {
+  const r = rooms.get(currentRoom); if (!r) return;
+  const seqs = r.msgs.filter((x) => !x.sys && Number.isInteger(x.seq)).map((x) => x.seq);
+  if (!seqs.length) return;
+  send({ type: 'history', roomId: currentRoom, beforeSeq: Math.min(...seqs), limit: 30 });
 };
 
 $('composer').onsubmit = (e) => {

@@ -101,8 +101,8 @@ async function createRoom(client, name) {
   return joined.roomId;
 }
 
-async function joinRoom(client, room, lastSeq = 0) {
-  client.send({ type: 'join', room, lastSeq });
+async function joinRoom(client, room, lastSeq = 0, lastEventSeq = 0) {
+  client.send({ type: 'join', room, lastSeq, lastEventSeq });
   return client.waitFor((m) => m.type === 'joined');
 }
 
@@ -440,6 +440,399 @@ test('持久化：服务重启后消息不丢失', async () => {
       await a.waitFor((m) => m.type === 'sync_done' && m.roomId === roomId);
       assert.deepEqual(a.roomSeqs(roomId), [1, 2, 3], '重启后历史消息完整可补发');
       await a.close();
+      server.stop();
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------- 编辑 / 撤回 / 审计
+
+/** 发一条消息并返回 ACK 分配的 seq */
+async function sendMsg(client, roomId, clientMsgId, content) {
+  client.send({ type: 'msg', roomId, clientMsgId, content });
+  const ack = await client.waitFor((m) => m.type === 'ack' && m.clientMsgId === clientMsgId);
+  return ack.seq;
+}
+
+test('编辑自己的消息：广播 msg_updated，版本号与编辑时间正确', async () => {
+  const { server, port } = await startServer();
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token);
+    const b = await Client.connect(port, ub.token);
+    const roomId = await createRoom(a, 'general');
+    await joinRoom(b, roomId);
+
+    const seq = await sendMsg(a, roomId, 'e1', 'original');
+    await b.waitFor((m) => m.type === 'msg' && m.seq === seq);
+
+    a.send({ type: 'edit', roomId, seq, version: 1, content: 'fixed' });
+    const upd = await b.waitFor((m) => m.type === 'msg_updated' && m.seq === seq);
+    assert.equal(upd.content, 'fixed');
+    assert.equal(upd.version, 2);
+    assert.equal(upd.eventSeq, 1);
+    assert.ok(upd.editedAt > 0);
+    assert.equal(upd.by, ua.userId);
+
+    // 历史翻页读到的是编辑后的内容与版本
+    a.send({ type: 'history', roomId, beforeSeq: seq + 1, limit: 10 });
+    const h = await a.waitFor((m) => m.type === 'history');
+    const row = h.messages.find((m) => m.seq === seq);
+    assert.equal(row.content, 'fixed');
+    assert.equal(row.version, 2);
+    assert.ok(row.editedAt > 0);
+    assert.equal(row.recalled, false);
+    await Promise.all([a.close(), b.close()]);
+  } finally {
+    server.stop();
+  }
+});
+
+test('权限：不能编辑他人消息；普通成员不能撤回他人消息；管理员撤成员消息必须带原因', async () => {
+  const { server, port } = await startServer();
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token);
+    const b = await Client.connect(port, ub.token);
+    const roomId = await createRoom(a, 'general');
+    await joinRoom(b, roomId);
+
+    const bobSeq = await sendMsg(b, roomId, 'b1', 'bob speaks');
+    const aliceSeq = await sendMsg(a, roomId, 'a1', 'alice speaks');
+    await b.waitFor((m) => m.type === 'msg' && m.seq === aliceSeq);
+
+    // 管理员也不能编辑别人的消息
+    a.send({ type: 'edit', roomId, seq: bobSeq, version: 1, content: 'hijacked' });
+    const err1 = await a.waitFor((m) => m.type === 'error');
+    assert.equal(err1.code, 'FORBIDDEN');
+
+    // 普通成员不能撤回他人消息
+    b.send({ type: 'recall', roomId, seq: aliceSeq, version: 1 });
+    const err2 = await b.waitFor((m) => m.type === 'error');
+    assert.equal(err2.code, 'FORBIDDEN');
+
+    // 管理员撤回成员消息不带原因必须被拒
+    a.send({ type: 'recall', roomId, seq: bobSeq, version: 1 });
+    const err3 = await a.waitFor((m) => m.type === 'error');
+    assert.equal(err3.code, 'BAD_REQUEST', '管理员处理他人消息必须填写原因');
+
+    // 带原因撤回成功并广播
+    a.send({ type: 'recall', roomId, seq: bobSeq, version: 1, reason: '违规内容' });
+    const rec = await b.waitFor((m) => m.type === 'msg_recalled' && m.seq === bobSeq);
+    assert.equal(rec.version, 2);
+    assert.equal(rec.reason, '违规内容');
+    assert.equal(rec.recalledBy, ua.userId);
+    assert.ok(rec.recalledAt > 0);
+    await Promise.all([a.close(), b.close()]);
+  } finally {
+    server.stop();
+  }
+});
+
+test('撤回后保留占位：内容屏蔽，历史/补发均带 recalled 与操作时间', async () => {
+  const { server, port } = await startServer();
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token);
+    let b = await Client.connect(port, ub.token);
+    const roomId = await createRoom(a, 'general');
+    await joinRoom(b, roomId);
+
+    const seq = await sendMsg(a, roomId, 'r1', 'will disappear');
+    await b.waitFor((m) => m.type === 'msg' && m.seq === seq);
+    await b.close();
+
+    // 发送者离线期间撤回自己的消息
+    a.send({ type: 'recall', roomId, seq, version: 1, reason: '发错了' });
+    const rec = await a.waitFor((m) => m.type === 'msg_recalled' && m.seq === seq);
+    assert.equal(rec.eventSeq, 1);
+
+    // B 重连：消息流与事件流分别补发；历史最终为撤回占位
+    b = await Client.connect(port, ub.token);
+    await joinRoom(b, roomId, 0, 0);
+    const done = await b.waitFor((m) => m.type === 'sync_done' && m.roomId === roomId);
+    assert.equal(done.lastEventSeq, 1);
+    const msg = b.log.filter((m) => m.type === 'msg' && m.seq === seq).pop();
+    assert.equal(msg.recalled, true);
+    assert.equal(msg.content, '', '撤回后内容不得再下发');
+    assert.ok(msg.recalledAt > 0);
+    assert.equal(msg.recallReason, '发错了');
+    const recalledEvt = b.log.find((m) => m.type === 'msg_recalled' && m.seq === seq);
+    assert.ok(recalledEvt, '离线期间的撤回事件须经事件流补发');
+
+    // 历史翻页同样返回占位
+    b.send({ type: 'history', roomId, beforeSeq: seq + 1, limit: 10 });
+    const h = await b.waitFor((m) => m.type === 'history');
+    const row = h.messages.find((m) => m.seq === seq);
+    assert.equal(row.recalled, true);
+    assert.equal(row.content, '');
+    assert.ok(row.recalledAt > 0);
+    await Promise.all([a.close(), b.close()]);
+  } finally {
+    server.stop();
+  }
+});
+
+test('审计轨迹：revisions 返回创建/编辑/撤回全部版本与操作人原因', async () => {
+  const { server, port } = await startServer();
+  try {
+    const ua = await login(port, 'alice');
+    const a = await Client.connect(port, ua.token);
+    const roomId = await createRoom(a, 'audit');
+    const seq = await sendMsg(a, roomId, 'a1', 'v1 text');
+
+    a.send({ type: 'edit', roomId, seq, version: 1, content: 'v2 text' });
+    await a.waitFor((m) => m.type === 'msg_updated' && m.seq === seq);
+    a.send({ type: 'edit', roomId, seq, version: 2, content: 'v3 text' });
+    await a.waitFor((m) => m.type === 'msg_updated' && m.seq === seq && m.version === 3);
+    a.send({ type: 'recall', roomId, seq, version: 3, reason: '本人撤回' });
+    await a.waitFor((m) => m.type === 'msg_recalled' && m.seq === seq);
+
+    a.send({ type: 'revisions', roomId, seq });
+    const r = await a.waitFor((m) => m.type === 'revisions' && m.seq === seq);
+    assert.equal(r.revisions.length, 4);
+    assert.deepEqual(r.revisions.map((x) => x.action), ['create', 'edit', 'edit', 'recall']);
+    assert.deepEqual(r.revisions.map((x) => x.version), [1, 2, 3, 4]);
+    assert.equal(r.revisions[0].content, 'v1 text');
+    assert.equal(r.revisions[2].content, 'v3 text');
+    assert.equal(r.revisions[3].content, null);
+    assert.equal(r.revisions[3].reason, '本人撤回');
+    assert.equal(r.revisions[3].actorName, 'alice');
+
+    // 撤回后不能再编辑
+    a.send({ type: 'edit', roomId, seq, version: 4, content: 'after recall' });
+    const err = await a.waitFor((m) => m.type === 'error');
+    assert.equal(err.code, 'RECALLED');
+    await a.close();
+  } finally {
+    server.stop();
+  }
+});
+
+test('乐观锁：基于旧版本的编辑/撤回被拒绝并回传最新状态', async () => {
+  const { server, port } = await startServer();
+  try {
+    const ua = await login(port, 'alice');
+    const a = await Client.connect(port, ua.token);
+    const roomId = await createRoom(a, 'general');
+    const seq = await sendMsg(a, roomId, 'c1', 'first');
+
+    // 第一次编辑 v1 -> v2 成功
+    a.send({ type: 'edit', roomId, seq, version: 1, content: 'second' });
+    await a.waitFor((m) => m.type === 'msg_updated' && m.version === 2);
+
+    // 迟到的旧操作（仍基于 v1）必须失败
+    a.send({ type: 'edit', roomId, seq, version: 1, content: 'stale edit' });
+    const err = await a.waitFor((m) => m.type === 'error' && m.code === 'VERSION_CONFLICT');
+    assert.equal(err.seq, seq);
+    assert.equal(err.current.version, 2, '冲突错误须携带最新消息视图');
+    assert.equal(err.current.content, 'second');
+    assert.equal(err.current.recalled, false);
+
+    // 撤回与编辑并发：消息尚未撤回时，基于旧版本 v1 的撤回同样必须冲突，不能覆盖新状态
+    a.send({ type: 'recall', roomId, seq, version: 1, reason: 'stale recall' });
+    const err2 = await a.waitFor((m) => m.type === 'error' && m.code === 'VERSION_CONFLICT');
+    assert.equal(err2.current.version, 2);
+    assert.equal(err2.current.recalled, false);
+
+    // 基于当前版本 v2 的撤回成功，最终状态为撤回占位 v3
+    a.send({ type: 'recall', roomId, seq, version: 2, reason: 'valid recall' });
+    await a.waitFor((m) => m.type === 'msg_recalled' && m.version === 3);
+    a.send({ type: 'history', roomId, beforeSeq: seq + 1, limit: 10 });
+    const h = await a.waitFor((m) => m.type === 'history');
+    const row = h.messages.find((m) => m.seq === seq);
+    assert.equal(row.recalled, true);
+    assert.equal(row.version, 3);
+    assert.equal(row.recallReason, 'valid recall', '迟到撤回的原因不得覆盖先到操作');
+    await a.close();
+  } finally {
+    server.stop();
+  }
+});
+
+test('撤回幂等：同版本重复撤回不产生新版本、不重复广播', async () => {
+  const { server, port } = await startServer();
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token);
+    const b = await Client.connect(port, ub.token);
+    const roomId = await createRoom(a, 'general');
+    await joinRoom(b, roomId);
+    const seq = await sendMsg(a, roomId, 'i1', 'hello');
+    await b.waitFor((m) => m.type === 'msg' && m.seq === seq);
+
+    a.send({ type: 'recall', roomId, seq, version: 1 });
+    await b.waitFor((m) => m.type === 'msg_recalled' && m.seq === seq);
+    // 客户端重试同一请求
+    a.send({ type: 'recall', roomId, seq, version: 1 });
+    await sleep(300);
+    assert.equal(
+      b.log.filter((m) => m.type === 'msg_recalled' && m.seq === seq).length,
+      1,
+      '重复撤回不得重复广播'
+    );
+    await Promise.all([a.close(), b.close()]);
+  } finally {
+    server.stop();
+  }
+});
+
+test('编辑后再撤回：离线成员经事件流按序收到 edit 与 recall', async () => {
+  const { server, port } = await startServer();
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token);
+    let b = await Client.connect(port, ub.token);
+    const roomId = await createRoom(a, 'general');
+    await joinRoom(b, roomId);
+    const seq = await sendMsg(a, roomId, 'er1', 'orig');
+    await b.waitFor((m) => m.type === 'msg' && m.seq === seq);
+    b.send({ type: 'ack', roomId, seq, eventSeq: 0 });
+    await b.close();
+
+    a.send({ type: 'edit', roomId, seq, version: 1, content: 'edited' });
+    await a.waitFor((m) => m.type === 'msg_updated' && m.version === 2);
+    a.send({ type: 'recall', roomId, seq, version: 2, reason: '违规' });
+    await a.waitFor((m) => m.type === 'msg_recalled' && m.version === 3);
+
+    // B 只带消息水位（seq 已看过），事件水位为 0 —— 两个事件都应补发且有序
+    b = await Client.connect(port, ub.token);
+    await joinRoom(b, roomId, seq, 0);
+    await b.waitFor((m) => m.type === 'sync_done' && m.roomId === roomId && m.lastEventSeq === 2);
+    const edits = b.log.filter((m) => m.type === 'msg_updated' && m.seq === seq);
+    const recalls = b.log.filter((m) => m.type === 'msg_recalled' && m.seq === seq);
+    assert.equal(edits.length, 1);
+    assert.equal(recalls.length, 1);
+    assert.equal(edits[0].eventSeq < recalls[0].eventSeq, true);
+    assert.equal(recalls[0].reason, '违规');
+    await Promise.all([a.close(), b.close()]);
+  } finally {
+    server.stop();
+  }
+});
+
+test('事件流 ACK：未确认的 msg_recalled 由服务端重发', async () => {
+  const { server, port } = await startServer({
+    ackResendIntervalMs: 50,
+
+    ackResendAfterMs: 100,
+    ackMaxResend: 10,
+  });
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const a = await Client.connect(port, ua.token);
+    const b = await Client.connect(port, ub.token);
+    const roomId = await createRoom(a, 'general');
+    await joinRoom(b, roomId);
+    const seq = await sendMsg(a, roomId, 'rr1', 'hi');
+    await b.waitFor((m) => m.type === 'msg' && m.seq === seq);
+
+    a.send({ type: 'recall', roomId, seq, version: 1 });
+    await b.waitFor((m) => m.type === 'msg_recalled' && m.seq === seq);
+    // 不 ACK 事件，应观察到重发
+    await b.waitFor((m) => m.type === 'msg_recalled' && m.seq === seq, 2000);
+    const count = b.log.filter((m) => m.type === 'msg_recalled' && m.seq === seq).length;
+    assert.ok(count >= 2, '状态事件帧同样受未 ACK 重发保护');
+
+    // 事件水位 ACK 后停止重发（不带 seq，只推进事件水位）
+    b.send({ type: 'ack', roomId, seq, eventSeq: 1 });
+    await sleep(100);
+    const after = b.log.filter((m) => m.type === 'msg_recalled' && m.seq === seq).length;
+    await sleep(400);
+    assert.equal(
+      b.log.filter((m) => m.type === 'msg_recalled' && m.seq === seq).length,
+      after,
+      '事件 ACK 后不再重发'
+    );
+    await Promise.all([a.close(), b.close()]);
+  } finally {
+    server.stop();
+  }
+});
+
+test('审计脱敏：撤回后非相关成员查 revisions 不见正文，发送者与管理员可见全文', async () => {
+  const { server, port } = await startServer();
+  try {
+    const ua = await login(port, 'alice');
+    const ub = await login(port, 'bob');
+    const uc = await login(port, 'carol');
+    const a = await Client.connect(port, ua.token);
+    const b = await Client.connect(port, ub.token);
+    const c = await Client.connect(port, uc.token);
+    const roomId = await createRoom(a, 'general');
+    await joinRoom(b, roomId);
+    await joinRoom(c, roomId);
+
+    const seq = await sendMsg(b, roomId, 'b1', 'secret content');
+    await c.waitFor((m) => m.type === 'msg' && m.seq === seq);
+    a.send({ type: 'recall', roomId, seq, version: 1, reason: '违规' });
+    await c.waitFor((m) => m.type === 'msg_recalled' && m.seq === seq);
+
+    // 旁观成员 carol：版本链可见，正文脱敏
+    c.send({ type: 'revisions', roomId, seq });
+    const rc = await c.waitFor((m) => m.type === 'revisions');
+    assert.equal(rc.revisions.length, 2);
+    assert.equal(rc.revisions[0].content, '');
+    assert.equal(rc.revisions[0].action, 'create');
+    assert.equal(rc.revisions[1].reason, '违规', '操作原因仍须可见');
+
+    // 发送者 bob 与管理员 alice 可见完整正文
+    b.send({ type: 'revisions', roomId, seq });
+    const rb = await b.waitFor((m) => m.type === 'revisions');
+    assert.equal(rb.revisions[0].content, 'secret content');
+    a.send({ type: 'revisions', roomId, seq });
+    const ra = await a.waitFor((m) => m.type === 'revisions');
+    assert.equal(ra.revisions[0].content, 'secret content');
+    await Promise.all([a.close(), b.close(), c.close()]);
+  } finally {
+    server.stop();
+  }
+});
+
+test('旧库迁移：存量消息补 create 审计行，字段读取正常', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-legacy-'));
+  const dbPath = path.join(dir, 'legacy.db');
+  try {
+    // 手工构造一张「旧版」schema 的库
+    const { DatabaseSync } = require('node:sqlite');
+    const legacy = new DatabaseSync(dbPath);
+    legacy.exec(`
+      CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, token_random TEXT NOT NULL, created_at INTEGER NOT NULL);
+      CREATE TABLE rooms (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, created_by TEXT NOT NULL, created_at INTEGER NOT NULL, last_seq INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE members (room_id TEXT NOT NULL, user_id TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'member', muted_until INTEGER NOT NULL DEFAULT 0, joined_at INTEGER NOT NULL, PRIMARY KEY (room_id, user_id));
+      CREATE TABLE messages (room_id TEXT NOT NULL, seq INTEGER NOT NULL, client_msg_id TEXT NOT NULL, sender_id TEXT NOT NULL, content TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY (room_id, seq));
+      CREATE TABLE cursors (room_id TEXT NOT NULL, user_id TEXT NOT NULL, last_ack_seq INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL, PRIMARY KEY (room_id, user_id));
+      INSERT INTO users VALUES ('u1','alice','rnd',1000);
+      INSERT INTO rooms VALUES ('r1','old','u1',1000,1);
+      INSERT INTO members VALUES ('r1','u1','admin',0,1000);
+      INSERT INTO messages VALUES ('r1',1,'cid','u1','legacy content',1234);
+    `);
+    legacy.close();
+
+    const { server, port } = await startServer({ dbPath });
+    try {
+      const token = require('../src/util').signToken('u1', 'rnd', server.config.authSecret);
+      const c = await Client.connect(port, token);
+      c.send({ type: 'revisions', roomId: 'r1', seq: 1 });
+      const r = await c.waitFor((m) => m.type === 'revisions');
+      assert.equal(r.revisions.length, 1);
+      assert.equal(r.revisions[0].action, 'create');
+      assert.equal(r.revisions[0].content, 'legacy content');
+
+      c.send({ type: 'history', roomId: 'r1', beforeSeq: 100, limit: 10 });
+      const h = await c.waitFor((m) => m.type === 'history');
+      assert.equal(h.messages[0].version, 1);
+      assert.equal(h.messages[0].content, 'legacy content');
+      await c.close();
+    } finally {
       server.stop();
     }
   } finally {

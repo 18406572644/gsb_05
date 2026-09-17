@@ -6,9 +6,13 @@ let nextConnId = 1;
 
 /**
  * 单条连接的运行时状态。
- * unacked: Map<roomId, Map<seq, {frame, lastSent, tries}>> —— 已推送但未被客户端
- * 累积 ACK 确认的消息，超时重发；这是「至少一次投递」的服务端正，配合客户端
- * 按 seq 去重（幂等消费）达到效果上的恰好一次。
+ * unacked: Map<roomId, {
+ *   msgs:   Map<seq,      {frame, lastSent, tries}>,
+ *   events: Map<eventSeq, {frame, lastSent, tries}>,
+ * }>
+ * 已推送但未被客户端累积 ACK 的消息帧与状态事件帧（编辑/撤回），超时重发；
+ * 这是「至少一次投递」的服务端正，配合客户端按 seq/eventSeq 去重（幂等消费）
+ * 达到效果上的恰好一次。两条水位互不阻塞：消息 ACK 不清事件、反之亦然。
  */
 class Connection {
   constructor(ws, user) {
@@ -23,37 +27,53 @@ class Connection {
     this.unackedCount = 0;
   }
 
-  trackUnacked(roomId, seq, frame) {
+  _room(roomId) {
     let room = this.unacked.get(roomId);
     if (!room) {
-      room = new Map();
+      room = { msgs: new Map(), events: new Map() };
       this.unacked.set(roomId, room);
     }
-    room.set(seq, { frame, lastSent: now(), tries: 0 });
+    return room;
+  }
+
+  /** kind: 'msg'（按 seq）或 'event'（按 eventSeq） */
+  trackUnacked(roomId, kind, key, frame) {
+    const room = this._room(roomId);
+    room[kind === 'event' ? 'events' : 'msgs'].set(key, { frame, lastSent: now(), tries: 0 });
     this.unackedCount++;
   }
 
-  /** 累积 ACK：清除 roomId 下所有 seq <= ackSeq 的未确认项，返回新确认的数量 */
-  ack(roomId, ackSeq) {
+  /**
+   * 累积 ACK：清除 roomId 下所有 seq <= ackSeq 的消息帧，以及 eventSeq <= ackEventSeq
+   * 的状态事件帧，返回新确认的总条数。任一水位缺省（null/undefined）表示不推进该水位。
+   */
+  ack(roomId, ackSeq, ackEventSeq) {
     const room = this.unacked.get(roomId);
     if (!room) return 0;
     let cleared = 0;
-    for (const seq of room.keys()) {
-      if (seq <= ackSeq) {
-        room.delete(seq);
-        cleared++;
+    if (Number.isInteger(ackSeq)) {
+      for (const seq of room.msgs.keys()) {
+        if (seq <= ackSeq) { room.msgs.delete(seq); cleared++; }
       }
     }
-    if (room.size === 0) this.unacked.delete(roomId);
+    if (Number.isInteger(ackEventSeq)) {
+      for (const eventSeq of room.events.keys()) {
+        if (eventSeq <= ackEventSeq) { room.events.delete(eventSeq); cleared++; }
+      }
+    }
+    if (room.msgs.size === 0 && room.events.size === 0) this.unacked.delete(roomId);
     this.unackedCount -= cleared;
     return cleared;
   }
 
-  /** 摘出所有超时未确认、需要重发的条目 */
+  /** 摘出所有超时未确认、需要重发的条目（消息帧与事件帧） */
   *pendingResends(staleMs) {
     const t = now();
     for (const room of this.unacked.values()) {
-      for (const entry of room.values()) {
+      for (const entry of room.msgs.values()) {
+        if (t - entry.lastSent >= staleMs) yield entry;
+      }
+      for (const entry of room.events.values()) {
         if (t - entry.lastSent >= staleMs) yield entry;
       }
     }
@@ -115,11 +135,8 @@ class Hub {
   leaveRoom(conn, roomId) {
     this._leaveRoomSet(roomId, conn);
     conn.rooms.delete(roomId);
-    const room = conn.unacked.get(roomId);
-    if (room) {
-      conn.unackedCount -= room.size;
-      conn.unacked.delete(roomId);
-    }
+    conn.unacked.delete(roomId);
+    this._recount(conn);
   }
 
   _leaveRoomSet(roomId, conn) {
@@ -130,6 +147,12 @@ class Hub {
     }
   }
 
+  _recount(conn) {
+    let n = 0;
+    for (const room of conn.unacked.values()) n += room.msgs.size + room.events.size;
+    conn.unackedCount = n;
+  }
+
   /** 房间内在线用户 ID 列表（去重） */
   onlineUserIds(roomId) {
     const set = this.byRoom.get(roomId);
@@ -138,10 +161,10 @@ class Hub {
   }
 
   /**
-   * 发送单帧到指定连接。track=true 时登记未 ACK 追踪（用于 msg 类帧）。
+   * 发送单帧到指定连接。track=true 时登记未 ACK 追踪（msg/event 类帧）。
    * 背压：未确认积压超过上限时断开连接（客户端重连后走 sync 补发）。
    */
-  send(conn, frame, { track = false, roomId = null, seq = null } = {}) {
+  send(conn, frame, { track = false, roomId = null, kind = 'msg', seq = null } = {}) {
     if (conn.ws.readyState !== 1 /* OPEN */) return false;
     if (track && conn.unackedCount >= this.config.maxUnackedPerConn) {
       conn.ws.close(1013, 'backpressure: too many unacked messages');
@@ -153,18 +176,18 @@ class Hub {
     } catch {
       return false;
     }
-    if (track && roomId != null && seq != null) conn.trackUnacked(roomId, seq, str);
+    if (track && roomId != null && seq != null) conn.trackUnacked(roomId, kind, seq, str);
     return true;
   }
 
   /** 广播到房间所有连接（含发送者的其他设备）。frame 只序列化一次。 */
-  broadcast(roomId, frame, { track = false, seq = null } = {}) {
+  broadcast(roomId, frame, { track = false, kind = 'msg', seq = null } = {}) {
     const set = this.byRoom.get(roomId);
     if (!set) return 0;
     const str = JSON.stringify(frame);
     let delivered = 0;
     for (const conn of set) {
-      if (this.send(conn, str, { track, roomId, seq })) delivered++;
+      if (this.send(conn, str, { track, roomId, kind, seq })) delivered++;
     }
     return delivered;
   }
@@ -183,7 +206,7 @@ class Hub {
     }
   }
 
-  /** 重发扫描：超时未 ACK 的消息重发；超过最大重发次数判定连接不可用，断开让客户端重连补发 */
+  /** 重发扫描：超时未 ACK 的消息/事件帧重发；超过最大重发次数判定连接不可用，断开让客户端重连补发 */
   resendSweep() {
     const { ackResendAfterMs, ackMaxResend } = this.config;
     for (const conn of this.all) {

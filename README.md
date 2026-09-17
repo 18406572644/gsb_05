@@ -7,6 +7,11 @@
 - **断线补发**：重连后按 `lastSeq` 增量回放缺口，分批拉取
 - **幂等去重**：`clientMsgId` 唯一约束防发送重试产生重复；客户端按 `seq` 过滤重复投递
 - **消息时序可控**：每房间单调递增 `seq`，由计数器在写事务内分配，保证房间内全序
+- **消息编辑 / 撤回**：仅本人可编辑；本人或管理员（违规处理，须填原因）可撤回；版本号
+  乐观锁防止并发旧操作覆盖新状态；撤回后历史保留「已撤回」占位、撤回人与操作时间
+- **完整审计**：消息每个版本（创建/编辑/撤回）落只增审计表，含内容快照、操作人、原因
+- **状态一致性**：编辑/撤回走独立的房间事件流（`eventSeq`），实时广播、断线补发、历史
+  翻页三条路径结果一致
 - **连接管理**：心跳保活、全局/单用户连接数上限、背压断开、优雅退出
 - **房间权限**：管理员 / 成员 / 禁言三种状态，管理员可禁言、解禁
 - **发送限流**：按用户令牌桶
@@ -16,7 +21,7 @@
 ```bash
 npm install
 npm start          # http://localhost:8080
-npm test           # 13 个集成测试
+npm test           # 23 个集成测试
 ```
 
 浏览器打开 `http://localhost:8080`，用不同昵称开两个标签页即可体验（建房、发消息、
@@ -42,10 +47,14 @@ test/chat.test.js   集成测试（node:test）
 | 表 | 说明 |
 |---|---|
 | `users` | 用户（演示级 token 认证） |
-| `rooms` | 房间，`last_seq` 为房间消息序号计数器 |
+| `rooms` | 房间，`last_seq` 为消息序号计数器，`last_event_seq` 为编辑/撤回事件计数器 |
 | `members` | 成员关系：`role`（admin/member）+ `muted_until`（禁言截止时间） |
-| `messages` | 消息。主键 `(room_id, seq)`；唯一键 `(room_id, sender_id, client_msg_id)` 为幂等键 |
-| `cursors` | 每用户每房间已确认游标 `last_ack_seq`，断线补发的服务端兜底依据 |
+| `messages` | 消息。主键 `(room_id, seq)`；唯一键 `(room_id, sender_id, client_msg_id)` 为幂等键；含 `version`、`edited_at`、`recalled_at/by/reason` |
+| `message_revisions` | **只增审计表**：消息每个版本一行（create/edit/recall），含内容快照、操作人（冗余姓名）、原因、时间 |
+| `message_events` | 编辑/撤回事件流，主键 `(room_id, event_seq)`，断线补发编辑撤回的依据 |
+| `cursors` | 每用户每房间双水位游标 `last_ack_seq` / `last_ack_event_seq` |
+
+旧版数据库启动时自动 `ALTER TABLE` 补列，并为存量消息回填 v1 的 create 审计行。
 
 ## 可靠性设计
 
@@ -70,23 +79,44 @@ test/chat.test.js   集成测试（node:test）
 
 ### 4. 断线补发：sync 协议
 
-客户端持久化每个房间的 `lastSeenSeq`。重连后：
+客户端持久化每个房间的消息水位 `lastSeenSeq` 与事件水位 `lastSeenEventSeq`。重连后：
 
 ```
-client → {type:'join', room, lastSeq: 41}
+client → {type:'join', room, lastSeq: 41, lastEventSeq: 3}
 server → {type:'joined', ...}
-server → {type:'msg', seq: 42} ... {type:'msg', seq: 57}   （缺口回放，按序）
-server → {type:'sync_done', roomId, lastSeq: 57, hasMore: false}
+server → {type:'msg', seq: 42} ... {type:'msg', seq: 57}        （消息缺口回放，按序）
+server → {type:'msg_updated'|'msg_recalled', ...}               （事件缺口回放，按序）
+server → {type:'sync_done', roomId, lastSeq: 57, lastEventSeq: 5, hasMore: false}
 ```
 
-`hasMore=true` 时客户端用新的 `lastSeq` 继续 `sync` 拉取下一批（单批上限
-`SYNC_BATCH_SIZE`，默认 500）。`lastSeq` 缺省时使用服务端保存的确认游标
+`hasMore=true` 时客户端用新的双水位继续 `sync` 拉取下一批（单批上限
+`SYNC_BATCH_SIZE`，默认 500）。任一水位缺省时使用服务端保存的对应游标
 （新设备场景）；历史消息可用 `history` 向前翻页。
 
 ### 5. 时序可控
 
 `seq` 由 `rooms.last_seq` 在写事务内递增分配（单写者 + 事务 = 无空洞、无并发交错），
 房间内消息严格全序。客户端凭 seq 即可检测空洞并触发补发，无需依赖时钟。
+
+### 6. 编辑 / 撤回：版本乐观锁 + 独立事件流
+
+房间内有**两条全序流**：消息流（`seq`）与状态事件流（`eventSeq`，编辑/撤回）。
+
+- **乐观锁防并发覆盖**：消息创建时 `version=1`，每次编辑或撤回在写事务内 `version+1`。
+  edit/recall 请求必须携带所基于的 `version`，事务内与当前版本不符即返回
+  `VERSION_CONFLICT` 并附最新消息视图。因此「编辑与撤回、审核或重发同时发生」时，
+  迟到的旧操作不可能覆盖先提交的新状态；撤回后再编辑返回 `RECALLED`；同版本重复撤回
+  幂等成功、不产生新版本也不重复广播。
+- **先落库再广播**：版本推进、审计行、事件行在同一个 IMMEDIATE 事务提交后才广播，
+  与发送路径同一可靠性原则。
+- **三条读取路径一致**：实时广播发 `msg_updated`/`msg_recalled` 事件；断线重连按
+  `lastEventSeq` 回放事件流；历史翻页直接读到当前态。三者共用同一帧构造。撤回消息
+  在消息流/翻页里就是 `recalled=true`、`content=''` 的占位帧，序号位置不变。
+- **事件流重发与 ACK**：事件帧同样登记未 ACK 队列、超时重发；客户端 ACK 携带
+  `seq` 与 `eventSeq` 双水位，服务端在 `cursors` 持久化双游标，新设备也能补齐。
+- **审计完整**：每个版本在 `message_revisions` 留一行（创建/编辑的内容快照、撤回人、
+  原因、时间），撤回不清空任何历史。查询审计时，被撤回消息的历史正文仅管理员与发送者
+  本人可见，其他成员看到脱敏版本链（操作人/原因/时间仍可见）。
 
 ## 协议（JSON 文本帧）
 
@@ -99,9 +129,12 @@ server → {type:'sync_done', roomId, lastSeq: 57, hasMore: false}
 | `join` | `room, lastSeq?` | 加入房间（room 可为 id 或名称）；带进度则立即补发 |
 | `leave` | `roomId` | 离开房间 |
 | `msg` | `roomId, clientMsgId, content` | 发消息，回 `ack` |
-| `ack` | `roomId, seq` | 累积确认：seq 及之前均已收到 |
-| `sync` | `roomId, lastSeq?` | 请求补发 |
-| `history` | `roomId, beforeSeq?, limit?` | 历史翻页（升序返回） |
+| `edit` | `roomId, seq, version, content, reason?` | 编辑**本人**消息，`version` 为基准版本 |
+| `recall` | `roomId, seq, version, reason?` | 撤回；本人撤回原因可选，管理员撤他人消息 `reason` 必填 |
+| `revisions` | `roomId, seq` | 查询消息审计轨迹（版本链） |
+| `ack` | `roomId, seq?, eventSeq?` | 累积确认：两个水位分别确认消息与编辑/撤回事件 |
+| `sync` | `roomId, lastSeq?, lastEventSeq?` | 请求补发（双水位） |
+| `history` | `roomId, beforeSeq?, limit?` | 历史翻页（升序返回，撤回消息为占位帧） |
 | `rooms` | — | 我加入的房间列表 |
 | `members` | `roomId` | 成员列表（含在线状态） |
 | `mute` | `roomId, userId, minutes` | 禁言（仅管理员，1..1440 分钟） |
@@ -112,17 +145,22 @@ server → {type:'sync_done', roomId, lastSeq: 57, hasMore: false}
 | 类型 | 说明 |
 |---|---|
 | `welcome` | 连接建立：`{userId, name, serverTime}` |
-| `joined` | 入房成功：`{roomId, name, role, mutedUntil, lastSeq}` |
-| `msg` | 房间消息：`{roomId, seq, clientMsgId, from, fromName, content, ts}` |
+| `joined` | 入房成功：`{roomId, name, role, mutedUntil, lastSeq, lastEventSeq}` |
+| `msg` | 房间消息：`{roomId, seq, clientMsgId, from, fromName, content, ts, version, editedAt, recalled, recalledAt, recalledBy, recalledByName, recallReason}` |
+| `msg_updated` | 编辑事件：`{roomId, seq, version, content, editedAt, by, byName, reason?, eventSeq, ts}` |
+| `msg_recalled` | 撤回事件：`{roomId, seq, version, recalledAt, recalledBy, recalledByName, reason?, eventSeq, ts}` |
+| `sync_done` | 一批补发结束：`{roomId, lastSeq, lastEventSeq, hasMore}` |
 | `ack` | 发送确认：`{roomId, clientMsgId, seq, ts}` |
-| `sync_done` | 一批补发结束：`{roomId, lastSeq, hasMore}` |
-| `history` / `rooms` / `members` | 对应查询的响应 |
+| `history` | 历史翻页响应；`messages[]` 与 `msg` 同构（撤回为占位） |
+| `revisions` | 审计响应：`{roomId, seq, revisions:[{version, action, content, actorId, actorName, reason, ts}]}` |
+| `rooms` / `members` | 对应查询的响应 |
 | `notice` | 房间事件（`muted` / `unmuted`） |
-| `error` | `{code, message, ref?}`，code 见下 |
+| `error` | `{code, message, ref?, seq?, current?}`，`current` 仅 `VERSION_CONFLICT` 时携带最新消息视图 |
 | `server_shutdown` | 服务即将关闭，请准备重连 |
 
 错误码：`BAD_FRAME` `BAD_REQUEST` `UNKNOWN_TYPE` `NOT_MEMBER` `NO_SUCH_ROOM`
-`ROOM_EXISTS` `FORBIDDEN` `MUTED` `RATE_LIMITED` `INTERNAL`；
+`NOT_FOUND` `ROOM_EXISTS` `FORBIDDEN` `MUTED` `RECALLED` `VERSION_CONFLICT`
+`RATE_LIMITED` `INTERNAL`；
 升级阶段拒绝：`401`（认证失败）、`503 SERVER_FULL` / `503 TOO_MANY_DEVICES`。
 
 ### 连接建立
